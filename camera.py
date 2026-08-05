@@ -1,0 +1,144 @@
+"""OpenCV 摄像头驱动"""
+import threading
+import time
+
+try:
+    import cv2
+    _HAS_CV2 = True
+except ImportError:
+    _HAS_CV2 = False
+
+
+class Camera:
+    """
+    OpenCV 摄像头驱动。
+
+    使用单例模式 + 独立采集线程，只保留最新帧。
+    """
+
+    _instance: "Camera | None" = None
+    _lock = threading.Lock()
+
+    def __init__(self, device: int = 0, width: int = 320, height: int = 180, fps: int = 10):
+        self._cap = None
+        self._device = device
+        self._width = width
+        self._height = height
+        self._fps = fps
+        self._frame = None
+        self._frame_ts = 0.0
+        self._frame_lock = threading.Lock()
+        self._frame_ready = threading.Event()
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    @classmethod
+    def get_instance(cls, device: int = 0, width: int = 320, height: int = 180, fps: int = 10) -> "Camera":
+        """获取 Camera 单例"""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    instance = Camera(device, width, height, fps)
+                    if not instance._open():
+                        cls._instance = None  # 清理失败单例，允许后续重试
+                        raise RuntimeError(f"Failed to open camera device {device}")
+                    cls._instance = instance
+                    cls._instance._start_capture()
+        return cls._instance
+
+    def _open(self) -> bool:
+        """打开摄像头，自动扫描可用设备（应对 USB 断连导致的设备号漂移）。"""
+        if not _HAS_CV2:
+            return False
+
+        # 先尝试请求的设备号，失败后扫描 0..9
+        candidates = [self._device] + [i for i in range(10) if i != self._device]
+        for dev in candidates:
+            cap = cv2.VideoCapture(dev)
+            if cap.isOpened():
+                # 尝试读取一帧确认设备真实可用
+                ret, _ = cap.read()
+                if not ret:
+                    cap.release()
+                    continue
+                self._cap = cap
+                self._device = dev
+                self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
+                self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
+                self._cap.set(cv2.CAP_PROP_FPS, self._fps)
+                return True
+            cap.release()
+
+        self._cap = None
+        return False
+        return False
+
+    def _start_capture(self):
+        """启动采集线程"""
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+
+    def _capture_loop(self):
+        """独立采集线程，只保留最新帧"""
+        interval = 1.0 / max(1, self._fps)
+        while self._running:
+            loop_start = time.monotonic()
+            if self._cap is None or not self._cap.isOpened():
+                time.sleep(0.1)
+                continue
+            ret, frame = self._cap.read()
+            if not ret or frame is None:
+                time.sleep(0.01)
+                continue
+            with self._frame_lock:
+                self._frame = frame.copy()
+                self._frame_ts = time.monotonic()
+            self._frame_ready.set()
+            elapsed = time.monotonic() - loop_start
+            if elapsed < interval:
+                time.sleep(interval - elapsed)
+
+    def is_available(self) -> bool:
+        """检查摄像头是否可用"""
+        return self._cap is not None and self._cap.isOpened()
+
+    def reconnect(self) -> bool:
+        """摄像头断连后自动重连（扫描所有可用设备）。"""
+        self.release()
+        time.sleep(0.5)
+        # 重置设备号，让 _open 重新扫描
+        self._device = 0
+        result = self._open()
+        if result:
+            self._start_capture()
+        return result
+
+    def read(self):
+        """读取最新帧（不拷贝，直接返回引用）"""
+        with self._frame_lock:
+            if self._frame is None:
+                return False, None
+            return True, self._frame
+
+    def release(self):
+        """释放摄像头资源"""
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+            self._thread = None
+        with self._frame_lock:
+            self._frame = None
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+    @classmethod
+    def reset(cls):
+        """重置单例"""
+        with cls._lock:
+            if cls._instance is not None:
+                cls._instance.release()
+            cls._instance = None
