@@ -128,6 +128,68 @@ class MotorController:
         self.max_pwm = max_pwm
         self._connected = False
 
+        # 标定扫描数据 [(pwm, rpm), ...] 用于运行时 PWM 自适应
+        self._calib_sweep: list[tuple[int, float]] = []
+
+    def set_calib_sweep(self, sweep: list[tuple[int, float]]) -> None:
+        """保存标定扫描数据，供 expected_rpm() / adapt_pwm() 使用。"""
+        self._calib_sweep = sweep
+
+    def expected_rpm(self, pwm: int) -> float:
+        """根据标定数据查表返回给定 PWM 下的期望 RPM（线性插值）。"""
+        if not self._calib_sweep:
+            return 0.0
+        pwm_abs = abs(pwm)
+        sweep = self._calib_sweep
+        # 边界
+        if pwm_abs <= sweep[0][0]:
+            frac = pwm_abs / max(1, sweep[0][0])
+            return frac * sweep[0][1]
+        if pwm_abs >= sweep[-1][0]:
+            # 外推
+            extra = pwm_abs - sweep[-1][0]
+            slope = (sweep[-1][1] - sweep[-2][1]) / max(1, sweep[-1][0] - sweep[-2][0])
+            return sweep[-1][1] + extra * slope
+        # 插值
+        for i in range(len(sweep) - 1):
+            if sweep[i][0] <= pwm_abs <= sweep[i + 1][0]:
+                frac = (pwm_abs - sweep[i][0]) / (sweep[i + 1][0] - sweep[i][0])
+                return sweep[i][1] + frac * (sweep[i + 1][1] - sweep[i][1])
+        return 0.0
+
+    def adapt_pwm(self, target_pwm: int, actual_rpm: int,
+                  max_pwm: int | None = None) -> int:
+        """自适应 PWM：若实际 RPM 显著低于期望，上调 PWM 补偿掉电/负载。
+
+        上限严格受控：最多 +2，且不超过 max_pwm 或标定最大值 +8。
+
+        Args:
+            target_pwm: 导航算法输出的原始 PWM
+            actual_rpm: ESP32 实测 RPM（取绝对值）
+            max_pwm: 绝对上限（默认取标定最大 PWM + 8）
+
+        Returns:
+            调整后的 PWM
+        """
+        if target_pwm == 0 or not self._calib_sweep:
+            return target_pwm
+
+        expected = self.expected_rpm(target_pwm)
+        if expected <= 0:
+            return target_pwm
+
+        if max_pwm is None:
+            max_pwm = min(self._calib_sweep[-1][0] + 8, self.max_pwm)
+
+        rpm_abs = abs(actual_rpm)
+        ratio = rpm_abs / expected
+
+        if ratio < 0.5:
+            return min(target_pwm + 2, max_pwm)  # 严重掉速，+2
+        elif ratio < 0.7:
+            return min(target_pwm + 1, max_pwm)  # 轻微掉速，+1
+        return target_pwm
+
     def connect(self) -> bool:
         """连接电机控制板。"""
         try:
@@ -234,8 +296,8 @@ class MotorController:
     def calibrate_pwm_for_rpm(self, target_rpm: float, timeout_s: float = 1.0) -> int:
         """从死区开始逐步增大 PWM，找到达到 target_rpm 的 PWM 值。
 
-        对标定后的速度控制至关重要：不依赖未标定的 max_linear_speed，
-        直接测量 PWM→RPM 映射。
+        记录所有 (PWM, RPM) 扫描点到 self._calib_sweep，
+        供运行时 expected_rpm() / adapt_pwm() 使用。
 
         Args:
             target_rpm: 目标转速 (RPM)
@@ -248,6 +310,7 @@ class MotorController:
             return self.min_effective_pwm + 5
 
         import time as _time
+        sweep = []
         for pwm in range(self.min_effective_pwm, self.max_pwm + 1, 2):
             self._chassis.set_speed(pwm, pwm)
             _time.sleep(timeout_s)
@@ -267,13 +330,16 @@ class MotorController:
                 continue
 
             avg_rpm = (sum(left_samples) + sum(right_samples)) / (len(left_samples) + len(right_samples))
+            sweep.append((pwm, avg_rpm))
             logger.info("  calibrate: PWM=%d → RPM=%.1f", pwm, avg_rpm)
 
             if avg_rpm >= target_rpm:
                 logger.info("Target RPM=%.0f reached at PWM=%d (measured %.1f RPM)",
                            target_rpm, pwm, avg_rpm)
+                self._calib_sweep = sweep
                 return pwm
 
+        self._calib_sweep = sweep
         return self.max_pwm
 
     def calibrate_rotation_pwm(self, target_rpm: float, timeout_s: float = 1.0) -> int:

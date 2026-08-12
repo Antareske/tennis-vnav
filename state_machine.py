@@ -297,6 +297,20 @@ class TennisNavStateMachine:
         deadzone = self.config.min_effective_pwm
         lp = max(deadzone, lp)
         rp = max(deadzone, rp)
+
+        # ── PWM 自适应（掉电补偿 + 打滑补偿，严格上限）──
+        abs_max = self._calibrated_fwd_pwm + 8  # 硬上限：标定值+8
+        actual_l, actual_r = self.motor.get_speeds()
+        lp = self.motor.adapt_pwm(lp, actual_l, max_pwm=abs_max)
+        rp = self.motor.adapt_pwm(rp, actual_r, max_pwm=abs_max)
+
+        # 打滑检测：一侧 RPM 远低于另一侧 → 微调对侧（单帧最多 +1）
+        al, ar = abs(actual_l), abs(actual_r)
+        if al > 5 and ar > 0 and al > ar * 3:
+            rp = min(rp + 1, abs_max)
+        elif ar > 5 and al > 0 and ar > al * 3:
+            lp = min(lp + 1, abs_max)
+
         self.motor.set_raw_speed(lp, rp)
         return lp, rp
 
