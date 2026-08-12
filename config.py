@@ -53,7 +53,7 @@ class NavConfig:
     min_turning_radius_m: float = 0.01  # 最小转弯半径（设很小=基本不调整曲率）
 
     # ── 跟踪阶段 ──
-    approach_deadband_m: float = 0.05   # APPROACH 横向死区：|ball_x| 小于此值直行
+    approach_deadband_m: float = 0.04   # APPROACH 横向死区：|ball_x| 小于此值直行
     lookahead_distance_m: float = 0.10  # Pure Pursuit 前视距离
     replan_threshold_m: float = 0.15    # 位置偏差超过此值重新规划
     replan_threshold_deg: float = 10.0  # 角度偏差超过此值重新规划
