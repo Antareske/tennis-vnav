@@ -275,6 +275,13 @@ class TennisNavStateMachine:
 
         fwd = self._calibrated_fwd_pwm
 
+        # 横向死区：小偏移（噪声级别）直行，避免频繁换向扭动
+        if abs(ball_x) < self.config.approach_deadband_m:
+            self._lateral_error_accum = 0.0
+            self._prev_ball_x_sign = 0
+            self.motor.set_raw_speed(fwd, fwd)
+            return fwd, fwd
+
         # 基础修正：横向偏差 → PWM 差异
         base_correction = int(abs(ball_x) * 80.0)
 
