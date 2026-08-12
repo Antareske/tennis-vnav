@@ -119,9 +119,11 @@ _lib_loaded = False
 def _load_library():
     """查找并加载 libcviruntime.so (及依赖 libcvikernel.so)。
 
+    搜索顺序：仓库自带 cvi-libs/ → 系统路径（兼容旧部署）。
     在 RISC-V 小车上调用，x86 环境没有这些 .so。
     """
-    lib_dirs = ["/root/AKA-00/lib", "/usr/bin/lib"]
+    repo_lib = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cvi-libs")
+    lib_dirs = [repo_lib, "/usr/bin/lib"]
 
     # 更新 LD_LIBRARY_PATH
     for d in lib_dirs:
@@ -143,19 +145,13 @@ def _load_library():
         logger.warning("libcvikernel.so not found in %s", lib_dirs)
 
     # Step 2: 加载 libcviruntime.so
-    candidates = [
-        "/root/AKA-00/lib/libcviruntime.so",
-        "/usr/bin/lib/libcviruntime.so",
-    ]
+    candidates = [os.path.join(d, "libcviruntime.so") for d in lib_dirs]
     for path in candidates:
         if os.path.exists(path):
             logger.info("Loading: %s", path)
             return ctypes.CDLL(path)
 
-    raise RuntimeError(
-        f"libcviruntime.so not found in {candidates}. "
-        f"Ensure the car has AKA-00 lib directory."
-    )
+    raise RuntimeError(f"libcviruntime.so not found in {candidates}")
 
 
 def _get_lib():

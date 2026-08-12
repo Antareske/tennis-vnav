@@ -11,7 +11,9 @@ devmem 0x03001068 32 0x6 2>/dev/null
 nohup /root/tennis-vnav/ctrl-serve > /tmp/ctrl-serve.log 2>&1 &
 
 # 导航 + 数采进程
+# LD_LIBRARY_PATH 含仓库自带中间件库（cvi-libs/）与系统 dl_lib
 cd /root/tennis-vnav
-nohup env LD_LIBRARY_PATH=/usr/bin/dl_lib python3 main.py > /tmp/vnav.log 2>&1 &
+nohup env LD_LIBRARY_PATH=/root/tennis-vnav/cvi-libs:/usr/bin/dl_lib \
+    python3 main.py > /tmp/vnav.log 2>&1 &
 
 exit 0

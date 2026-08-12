@@ -1,101 +1,82 @@
 #!/bin/bash
-# tennis-vnav 部署脚本
+# tennis-vnav 完整部署脚本（纯净 SG2002 Linux 镜像 → 可用）
 #
-# 通过 rsync 将本地代码同步到小车（Linux），然后可选重启服务。
-# 用于 SSH 远程测试的快速迭代。
+# 部署内容:
+#   1. 运行时资产（Python 代码、libhwjpeg.so、ctrl-serve、模型、cvi-libs）
+#   2. 开机自启脚本 S99vnav
+#   3. 重启服务
 #
 # 用法:
-#   ./scripts/deploy.sh root@192.168.4.1           # 部署到指定主机
-#   ./scripts/deploy.sh root@192.168.4.1 --restart # 部署 + 重启服务
-#   ./scripts/deploy.sh root@192.168.4.1 --dry-run # 预览变更
+#   ./scripts/deploy.sh [--host root@192.168.4.1] [--no-restart]
 #
-# 环境变量:
-#   VNAV_HOST     默认目标主机
-#   VNAV_PATH     目标路径 (默认: /root/tennis-vnav)
+# 依赖: sshpass（密码 root，可按需修改 VNAV_PASS）
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-
-# ── 参数解析 ──
-HOST="${1:-${VNAV_HOST}}"
-RESTART=false
-DRY_RUN=false
-shift 2>/dev/null || true
+HOST="root@192.168.4.1"
+VNAV_PASS="${VNAV_PASS:-root}"
+RESTART=true
 
 for arg in "$@"; do
     case "$arg" in
-        --restart) RESTART=true ;;
-        --dry-run) DRY_RUN=true ;;
+        --host=*) HOST="${arg#*=}" ;;
+        --no-restart) RESTART=false ;;
         *) HOST="$arg" ;;
     esac
 done
 
-if [ -z "$HOST" ]; then
-    echo "用法: $0 <user@host> [--restart] [--dry-run]"
-    echo ""
-    echo "示例:"
-    echo "  $0 root@192.168.4.1"
-    echo "  $0 root@192.168.4.1 --restart"
-    echo ""
-    echo "环境变量:"
-    echo "  VNAV_HOST=root@192.168.4.1  # 设置默认主机"
-    exit 1
+SSH="sshpass -p $VNAV_PASS ssh -o StrictHostKeyChecking=no"
+SCP="sshpass -p $VNAV_PASS scp -o StrictHostKeyChecking=no"
+
+BOARD_DIR="/root/tennis-vnav"
+
+echo "=== tennis-vnav 部署 → $HOST ==="
+
+# ── 0. 停止旧进程（运行中的二进制无法覆盖）──
+echo "[0/4] 停止旧进程..."
+$SSH "$HOST" "killall python3 ctrl-serve 2>/dev/null; sleep 1" || true
+
+# ── 1. 运行时 Python 文件 ──
+PY_FILES="
+main.py motor.py motor_tt_pid.py state_machine.py config.py
+data_collector.py hwjpeg_enc.py vnav_control.py camera.py
+detector.py estimator.py tpu_detector.py calibrate.py planner.py
+state_collector.py angle_config.py arm.py controller.py
+"
+echo "[1/4] 上传 Python 文件..."
+$SSH "$HOST" "mkdir -p $BOARD_DIR"
+# shellcheck disable=SC2086
+$SCP $PY_FILES "$HOST:$BOARD_DIR/"
+
+# ── 2. 二进制资产 ──
+echo "[2/4] 上传二进制与模型..."
+$SCP libhwjpeg.so ctrl-serve/ctrl-serve "$HOST:$BOARD_DIR/"
+$SSH "$HOST" "mkdir -p $BOARD_DIR/models $BOARD_DIR/cvi-libs"
+$SCP models/tennis.onnx models/yolov8n_tennis_v2.cvimodel "$HOST:$BOARD_DIR/models/"
+$SCP cvi-libs/* "$HOST:$BOARD_DIR/cvi-libs/"
+
+# ── 3. 开机自启 ──
+echo "[3/4] 安装开机自启脚本..."
+$SCP services/S99vnav "$HOST:/etc/init.d/S99vnav"
+$SSH "$HOST" "chmod +x /etc/init.d/S99vnav"
+
+# ── 4. 重启服务 ──
+if [ "$RESTART" = true ]; then
+    echo "[4/4] 重启服务..."
+    $SSH "$HOST" "killall python3 ctrl-serve 2>/dev/null; sleep 1;
+        devmem 0x03001064 32 0x6 2>/dev/null;
+        devmem 0x03001068 32 0x6 2>/dev/null;
+        nohup $BOARD_DIR/ctrl-serve > /tmp/ctrl-serve.log 2>&1 &
+        cd $BOARD_DIR &&
+        nohup env LD_LIBRARY_PATH=$BOARD_DIR/cvi-libs:/usr/bin/dl_lib \
+            python3 main.py > /tmp/vnav.log 2>&1 &
+        sleep 5"
+    echo "服务已重启，验证:"
+    $SSH "$HOST" "curl -s http://192.168.4.1/status"
+    echo
+else
+    echo "[4/4] 跳过重启（重启板子后 S99vnav 生效）"
 fi
 
-TARGET_PATH="${VNAV_PATH:-/root/tennis-vnav}"
-
-echo "=== tennis-vnav 部署 ==="
-echo "  源:     $SCRIPT_DIR"
-echo "  目标:   $HOST:$TARGET_PATH"
-echo ""
-
-# ── rsync 选项 ──
-RSYNC_OPTS=(
-    -avz
-    --progress
-    --exclude='__pycache__'
-    --exclude='*.pyc'
-    --exclude='.git'
-    --exclude='models/*.onnx'      # 模型文件首次需单独上传
-    --exclude='*.json'             # 不覆盖标定数据
-    --exclude='arm_angles*.json'
-    --exclude='cert.pem'
-    --exclude='key.pem'
-    --exclude='output'
-    --exclude='images'
-    --exclude='node_modules'
-)
-
-if $DRY_RUN; then
-    RSYNC_OPTS+=(--dry-run)
-fi
-
-# ── 执行同步 ──
-rsync "${RSYNC_OPTS[@]}" "$SCRIPT_DIR/" "$HOST:$TARGET_PATH/"
-
-echo ""
-echo "同步完成"
-
-# ── 远程安装 systemd 服务 ──
-if ! $DRY_RUN; then
-    echo ""
-    echo "安装 systemd 服务..."
-    ssh "$HOST" "cp -f $TARGET_PATH/services/tennis-vnav.service /etc/systemd/system/ 2>/dev/null && systemctl daemon-reload" || true
-fi
-
-# ── 重启服务 ──
-if $RESTART && ! $DRY_RUN; then
-    echo ""
-    echo "重启服务..."
-    ssh "$HOST" "systemctl restart tennis-vnav && echo 'OK' || echo 'FAILED'"
-    echo ""
-    echo "查看日志: ssh $HOST 'journalctl -u tennis-vnav -f'"
-fi
-
-echo ""
 echo "=== 部署完成 ==="
-echo "  SSH 登录: ssh $HOST"
-echo "  启动:     ssh $HOST 'systemctl start tennis-vnav'"
-echo "  日志:     ssh $HOST 'journalctl -u tennis-vnav -f'"
-echo "  状态:     ssh $HOST 'systemctl status tennis-vnav'"

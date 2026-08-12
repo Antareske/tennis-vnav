@@ -70,13 +70,28 @@ Episode 结构：静止 0.5s → 导航全程 → 静止 1s，首尾帧 action=(
 | nightly Rust 工具链 | ctrl-serve 交叉编译（`-Zbuild-std` 模式） |
 | `hwjpeg-sdk/`（仓库内） | sophgo cvi_mpi（sg200x-dev 分支）中间件头文件，hwjpeg.c 编译依赖 |
 
-### 板端（SD 卡镜像自带）
+### 板端
 
-| 资产 | 路径 |
+板端全部运行资产随仓库分发，部署脚本统一上传，**不依赖 AKA-00 等外部项目**：
+
+| 资产 | 仓库路径 | 板端路径 |
+|------|---------|---------|
+| CVI 运行时 | `cvi-libs/libcviruntime.so`、`libcvikernel.so` | `/root/tennis-vnav/cvi-libs/` |
+| 中间件 | `cvi-libs/libsys.so`、`libvenc.so` | `/root/tennis-vnav/cvi-libs/` |
+| 原子库 | `cvi-libs/libatomic.so.1` | `/root/tennis-vnav/cvi-libs/` |
+| VENC 封装 | `libhwjpeg.so` | `/root/tennis-vnav/` |
+| 控制服务 | `ctrl-serve/ctrl-serve` | `/root/tennis-vnav/` |
+| YOLO 模型 | `models/tennis.onnx`、`models/yolov8n_tennis_v2.cvimodel` | `/root/tennis-vnav/models/` |
+
+纯净镜像自带（部署前置条件，README 不负责安装）：
+
+| 资产 | 说明 |
 |------|------|
-| 中间件库 | `/usr/bin/dl_lib/libsys.so`、`libvenc.so`（加载需 `libatomic.so.1` 预加载） |
-| TPU 运行时 | `/usr/bin/lib/libcviruntime.so`、`libcvikernel.so` |
-| YOLO 模型 | `/root/tennis-vnav/models/yolov8n_tennis_v2.cvimodel` |
+| Python 3.11 + OpenCV + numpy | 板端图像处理与推理预处理 |
+| pyserial | ESP32 串口通信 |
+| BusyBox + hostapd + udhcpd | init 系统与 AP 热点（S98apstart） |
+
+运行时库加载顺序：仓库 `cvi-libs/` 优先，回退镜像系统路径（`/usr/bin/lib`、`/usr/bin/dl_lib`）。
 
 ## 构建流程
 
@@ -94,21 +109,16 @@ cargo build --release --target riscv64gc-unknown-linux-musl -Zbuild-std=std,pani
 
 ## 部署流程
 
+纯净镜像 + 仓库即可部署（无需 AKA-00 等外部项目）：
+
 ```bash
-# 1. 上传运行资产到板端 /root/tennis-vnav/
-scp main.py motor.py motor_tt_pid.py state_machine.py config.py \
-    data_collector.py hwjpeg_enc.py vnav_control.py camera.py \
-    detector.py estimator.py tpu_detector.py calibrate.py planner.py \
-    state_collector.py angle_config.py arm.py controller.py \
-    libhwjpeg.so ctrl-serve root@192.168.4.1:/root/tennis-vnav/
-
-# 2. 安装开机自启脚本（BusyBox rcS 约定，S98apstart 之后执行）
-scp services/S99vnav root@192.168.4.1:/etc/init.d/S99vnav
-ssh root@192.168.4.1 "chmod +x /etc/init.d/S99vnav"
-
-# 3. 重启或手动启动
-#    开机流程: S98apstart(AP 热点) → S99vnav(UART pinmux + ctrl-serve + main.py)
+# 一键部署（上传全部资产 + 安装自启 + 重启服务）
+./scripts/deploy.sh                          # 默认 root@192.168.4.1
+./scripts/deploy.sh --no-restart             # 仅上传，重启板子后生效
 ```
+
+部署完成后：重启板子（或脚本已重启服务），开机流程为
+`S98apstart（AP 热点）→ S99vnav（UART pinmux + ctrl-serve + main.py）`。
 
 手动启动（调试用）：
 
@@ -116,7 +126,7 @@ ssh root@192.168.4.1 "chmod +x /etc/init.d/S99vnav"
 ssh root@192.168.4.1
 devmem 0x03001064 32 0x6 && devmem 0x03001068 32 0x6   # UART pinmux
 /root/tennis-vnav/ctrl-serve &
-cd /root/tennis-vnav && LD_LIBRARY_PATH=/usr/bin/dl_lib python3 main.py
+cd /root/tennis-vnav && python3 main.py                # 库路径由代码自动解析
 ```
 
 ## 使用与测试流程

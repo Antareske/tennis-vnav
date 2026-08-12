@@ -1,6 +1,6 @@
 """YOLO 网球检测模块。
 
-从 AKA-00 tennis_hunter.py 提取 yolo_infer() 并增强：
+从网球检测参考实现提取 yolo_infer() 并增强：
 - is_bbox_valid() 检查检测框是否完整在画面内
 - select_best_bbox() 统一接口，自动选择最优检测框
 - 自动检测平台：SG2002 (RISC-V) 使用 TPU ctypes 后端，其他使用 ONNX runtime

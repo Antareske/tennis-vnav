@@ -42,24 +42,44 @@ static CVI_S32 (*p_CVI_VENC_SetJpegParam)(VENC_CHN, const VENC_JPEG_PARAM_S *);
 static int g_initialized = 0;
 static int g_width = 0, g_height = 0;
 
-#define DLIB "/usr/bin/dl_lib/"
+/* 中间件库搜索路径：优先仓库自带 cvi-libs/，回退系统 dl_lib */
+static const char *LIB_DIRS[] = {
+	"cvi-libs/",
+	"/root/tennis-vnav/cvi-libs/",
+	"/usr/bin/dl_lib/",
+	NULL,
+};
+
+static void *dlopen_try(const char *name)
+{
+	for (int i = 0; LIB_DIRS[i]; i++) {
+		char path[256];
+		snprintf(path, sizeof(path), "%s%s", LIB_DIRS[i], name);
+		void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+		if (h)
+			return h;
+	}
+	return NULL;
+}
 
 static int load_symbols(void)
 {
-	void *h_atomic = dlopen("libatomic.so.1", RTLD_NOW | RTLD_GLOBAL);
+	void *h_atomic = dlopen_try("libatomic.so.1");
+	if (!h_atomic)
+		h_atomic = dlopen("libatomic.so.1", RTLD_NOW | RTLD_GLOBAL);
 	if (!h_atomic) {
 		fprintf(stderr, "[hwjpeg] dlopen libatomic: %s\n", dlerror());
 		/* 非致命：若调用进程已预加载则继续 */
 	}
 
-	void *h_sys = dlopen(DLIB "libsys.so", RTLD_NOW | RTLD_GLOBAL);
+	void *h_sys = dlopen_try("libsys.so");
 	if (!h_sys) {
-		fprintf(stderr, "[hwjpeg] dlopen libsys.so: %s\n", dlerror());
+		fprintf(stderr, "[hwjpeg] libsys.so 加载失败: %s\n", dlerror());
 		return -1;
 	}
-	void *h_venc = dlopen(DLIB "libvenc.so", RTLD_NOW | RTLD_GLOBAL);
+	void *h_venc = dlopen_try("libvenc.so");
 	if (!h_venc) {
-		fprintf(stderr, "[hwjpeg] dlopen libvenc.so: %s\n", dlerror());
+		fprintf(stderr, "[hwjpeg] libvenc.so 加载失败: %s\n", dlerror());
 		return -1;
 	}
 

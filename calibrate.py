@@ -644,7 +644,7 @@ class CalibrationRunner:
     def run_all(self):
         """按顺序执行所有标定测试。"""
         logger.info("╔══════════════════════════════════════════╗")
-        logger.info("║    AKA-VNav 一次性标定数据采集           ║")
+        logger.info("║    VNav 一次性标定数据采集           ║")
         logger.info("║    所有测试按顺序执行                    ║")
         logger.info("║    请按提示操作                          ║")
         logger.info("╚══════════════════════════════════════════╝")

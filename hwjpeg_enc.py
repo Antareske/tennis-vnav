@@ -36,11 +36,24 @@ class HwJpegEncoder:
         if not _LIB_PATH.exists():
             raise RuntimeError(f"libhwjpeg.so 不存在: {_LIB_PATH}")
 
+        # 仓库自带中间件库（cvi-libs/）加入动态链接搜索路径，
+        # libvenc.so 的 NEEDED libsys.so 依赖由此解析
+        repo_lib = str(_LIB_DIR / "cvi-libs")
+        existing = os.environ.get("LD_LIBRARY_PATH", "")
+        if repo_lib not in existing:
+            os.environ["LD_LIBRARY_PATH"] = (
+                repo_lib + ":" + existing if existing else repo_lib
+            )
+
         # libsys.so 需要 __atomic_compare_exchange_1（libatomic）
-        try:
-            ctypes.CDLL("/usr/lib/libatomic.so.1", mode=ctypes.RTLD_GLOBAL)
-        except OSError:
-            pass  # 可能已由环境预加载
+        # 优先仓库自带，回退系统路径
+        for libatomic in [str(_LIB_DIR / "cvi-libs" / "libatomic.so.1"),
+                          "/usr/lib/libatomic.so.1"]:
+            try:
+                ctypes.CDLL(libatomic, mode=ctypes.RTLD_GLOBAL)
+                break
+            except OSError:
+                continue
 
         self._lib = ctypes.CDLL(str(_LIB_PATH))
         self._lib.hwjpeg_init.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
