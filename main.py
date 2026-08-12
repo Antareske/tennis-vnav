@@ -177,8 +177,8 @@ def main():
         while not sm.is_done():
             loop_start = time.time()
 
-            # 读取帧（带断连重试）
-            ret, frame = camera.read()
+            # 读取帧（带断连重试）— BGR 供 YOLO 使用
+            ret, frame = camera.read_bgr()
             if not ret or frame is None:
                 camera_error_count += 1
                 if camera_error_count > 30:  # ~2s 无帧，尝试重连

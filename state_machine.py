@@ -307,11 +307,11 @@ class TennisNavStateMachine:
         rp = max(deadzone, rp)
 
         # ── PWM 自适应（掉电补偿 + 打滑补偿，严格上限）──
-        # RPM 查询限频：每 150ms 查询一次（串口往返 28ms，避免占用主循环），
+        # RPM 查询限频：每 300ms 查询一次（串口往返 28ms，避免占用主循环），
         # 中间帧复用缓存值
         abs_max = self._calibrated_fwd_pwm + 8  # 硬上限：标定值+8
         now = time.time()
-        if now - self._last_adapt_query >= 0.15:
+        if now - self._last_adapt_query >= 0.30:
             actual_l, actual_r = self.motor.get_speeds()
             self._last_adapt_query = now
         else:

@@ -179,50 +179,90 @@ int hwjpeg_encode(const unsigned char *bgr, int width, int height,
 		  unsigned char **out_ptr, int *out_len)
 {
 	CVI_S32 s32Ret;
-	VB_CAL_CONFIG_S stVbCfg;
 	VIDEO_FRAME_INFO_S stFrameInfo;
 	VIDEO_FRAME_S *pstVFrame;
 	VB_BLK blk;
 	CVI_U64 u64Phys;
-	void *pVir;
+	CVI_U8 *pVir;
 	VENC_STREAM_S stStream;
 	VENC_PACK_S stPack;
+	CVI_U32 stride, ysize, uvsize, blksize;
+	CVI_U8 *pY, *pUV;
 
 	if (!g_initialized || !bgr || !out_ptr || !out_len)
 		return -1;
 
-	memset(&stVbCfg, 0, sizeof(stVbCfg));
-	COMMON_GetPicBufferConfig(width, height, PIXEL_FORMAT_BGR_888,
-				  DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0, &stVbCfg);
+	/* VENC 不接受 RGB 输入，转 NV12 + 显式双平面地址。
+	 * 只填 plane 0 时硬件会从垃圾地址读色度 → 整帧花屏。 */
+	stride = width;
+	ysize = stride * height;
+	uvsize = stride * height / 2;
+	blksize = ysize + uvsize;
 
-	blk = p_CVI_VB_GetBlock(VB_INVALID_POOLID, stVbCfg.u32VBSize);
+	blk = p_CVI_VB_GetBlock(VB_INVALID_POOLID, blksize);
 	if (blk == VB_INVALID_HANDLE) {
 		fprintf(stderr, "[hwjpeg] GetBlock failed\n");
 		return -1;
 	}
 
 	u64Phys = p_CVI_VB_Handle2PhysAddr(blk);
-	pVir = p_CVI_SYS_Mmap(u64Phys, stVbCfg.u32VBSize);
+	pVir = (CVI_U8 *)p_CVI_SYS_Mmap(u64Phys, blksize);
 	if (!pVir || pVir == (void *)-1) {
 		fprintf(stderr, "[hwjpeg] SYS_Mmap failed\n");
 		p_CVI_VB_ReleaseBlock(blk);
 		return -1;
 	}
-	memcpy(pVir, bgr, (size_t)width * height * 3);
+
+	/* YUYV → NV12（纯字节重排，无色彩运算）
+	 * YUYV 每 4 字节 = [Y0 U Y1 V]。
+	 * VB 缓冲是 uncached 映射，先在缓存内存转换，再 memcpy 进 VB。 */
+	pY = pVir;
+	pUV = pVir + ysize;
+	{
+		CVI_U8 *tmp = malloc(blksize);
+		CVI_U8 *tY = tmp;
+		CVI_U8 *tUV = tmp + ysize;
+		if (!tmp) {
+			p_CVI_SYS_Munmap(pVir, blksize);
+			p_CVI_VB_ReleaseBlock(blk);
+			return -1;
+		}
+
+		for (int y = 0; y < height; y += 2) {
+			const CVI_U8 *row0 = bgr + y * width * 2;       /* YUYV 行 */
+			const CVI_U8 *row1 = row0 + width * 2;
+			CVI_U8 *y0 = tY + y * stride;
+			CVI_U8 *y1 = y0 + stride;
+			CVI_U8 *uv = tUV + (y / 2) * stride;
+			for (int x = 0; x < width; x += 2) {
+				y0[x]     = row0[x * 2];
+				y0[x + 1] = row0[x * 2 + 2];
+				y1[x]     = row1[x * 2];
+				y1[x + 1] = row1[x * 2 + 2];
+				uv[x]     = row0[x * 2 + 1];   /* U（丢弃奇数行，垂直 1/2 抽样） */
+				uv[x + 1] = row0[x * 2 + 3];   /* V */
+			}
+		}
+		memcpy(pVir, tmp, blksize);
+		free(tmp);
+	}
 
 	memset(&stFrameInfo, 0, sizeof(stFrameInfo));
 	pstVFrame = &stFrameInfo.stVFrame;
 	pstVFrame->u32Width = width;
 	pstVFrame->u32Height = height;
-	pstVFrame->enPixelFormat = PIXEL_FORMAT_BGR_888;
+	pstVFrame->enPixelFormat = PIXEL_FORMAT_NV12;
 	pstVFrame->enVideoFormat = VIDEO_FORMAT_LINEAR;
-	pstVFrame->enColorGamut = COLOR_GAMUT_BT709;
 	pstVFrame->enDynamicRange = DYNAMIC_RANGE_SDR8;
 	pstVFrame->enCompressMode = COMPRESS_MODE_NONE;
-	pstVFrame->u32Stride[0] = stVbCfg.u32MainStride;
-	pstVFrame->u32Length[0] = stVbCfg.u32MainYSize;
+	pstVFrame->u32Stride[0] = stride;
+	pstVFrame->u32Stride[1] = stride;
 	pstVFrame->u64PhyAddr[0] = u64Phys;
-	pstVFrame->pu8VirAddr[0] = (CVI_U8 *)pVir;
+	pstVFrame->u64PhyAddr[1] = u64Phys + ysize;
+	pstVFrame->pu8VirAddr[0] = pVir;
+	pstVFrame->pu8VirAddr[1] = pVir + ysize;
+	pstVFrame->u32Length[0] = ysize;
+	pstVFrame->u32Length[1] = uvsize;
 	stFrameInfo.u32PoolId = p_CVI_VB_Handle2PoolId(blk);
 
 	s32Ret = p_CVI_VENC_SendFrame(0, &stFrameInfo, 100);
@@ -262,12 +302,12 @@ int hwjpeg_encode(const unsigned char *bgr, int width, int height,
 	}
 
 	p_CVI_VENC_ReleaseStream(0, &stStream);
-	p_CVI_SYS_Munmap(pVir, stVbCfg.u32VBSize);
+	p_CVI_SYS_Munmap(pVir, blksize);
 	p_CVI_VB_ReleaseBlock(blk);
 	return 0;
 
 fail:
-	p_CVI_SYS_Munmap(pVir, stVbCfg.u32VBSize);
+	p_CVI_SYS_Munmap(pVir, blksize);
 	p_CVI_VB_ReleaseBlock(blk);
 	return -1;
 }
