@@ -308,8 +308,10 @@ class TennisNavStateMachine:
         al, ar = abs(actual_l), abs(actual_r)
         if al > 5 and ar > 0 and al > ar * 3:
             rp = min(rp + 1, abs_max)
+            logger.info("slip: 左轮打滑(L=%d R=%d) → 右PWM+1=%d", actual_l, actual_r, rp)
         elif ar > 5 and al > 0 and ar > al * 3:
             lp = min(lp + 1, abs_max)
+            logger.info("slip: 右轮打滑(L=%d R=%d) → 左PWM+1=%d", actual_l, actual_r, lp)
 
         self.motor.set_raw_speed(lp, rp)
         return lp, rp

@@ -182,12 +182,22 @@ class MotorController:
             max_pwm = min(self._calib_sweep[-1][0] + 8, self.max_pwm)
 
         rpm_abs = abs(actual_rpm)
+        if rpm_abs == 0:
+            # RPM=0 可能是 ESP32 查询超时（返回默认值），非真实停转，
+            # 跳过本帧补偿，避免误触发
+            return target_pwm
         ratio = rpm_abs / expected
 
         if ratio < 0.5:
-            return min(target_pwm + 2, max_pwm)  # 严重掉速，+2
+            adjusted = min(target_pwm + 2, max_pwm)
+            logger.info("adapt: PWM %d→%d (RPM %.0f vs exp %.0f, ratio=%.2f, 严重掉速)",
+                       target_pwm, adjusted, rpm_abs, expected, ratio)
+            return adjusted
         elif ratio < 0.7:
-            return min(target_pwm + 1, max_pwm)  # 轻微掉速，+1
+            adjusted = min(target_pwm + 1, max_pwm)
+            logger.info("adapt: PWM %d→%d (RPM %.0f vs exp %.0f, ratio=%.2f, 轻微掉速)",
+                       target_pwm, adjusted, rpm_abs, expected, ratio)
+            return adjusted
         return target_pwm
 
     def connect(self) -> bool:

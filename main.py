@@ -124,16 +124,23 @@ def main():
     # ── 启动状态采集 ──
     start_state_collector(motor, config)
 
-    # ── 电机自动标定 ──
-    if motor.is_connected:
-        logger.info("正在标定电机（从死区搜索目标 RPM）...")
-        fwd_pwm = motor.calibrate_pwm_for_rpm(config.target_forward_rpm)
-        rot_pwm = motor.calibrate_rotation_pwm(config.target_rotation_rpm)
-        logger.info("标定完成: 前进 PWM=%d (target %.0f RPM), 旋转 PWM=%d (target %.0f RPM)",
-                    fwd_pwm, config.target_forward_rpm, rot_pwm, config.target_rotation_rpm)
-    else:
-        fwd_pwm = config.min_effective_pwm + 5
-        rot_pwm = config.min_effective_pwm + 3
+    # ── 电机标定（使用经验 PWM 值，跳过动态扫描）──
+    # 经验值：PWM=26 对应 ~18 RPM 前进，PWM=26 对应 ~14 RPM 旋转差速
+    # 若需动态标定，取消注释下面代码：
+    # if motor.is_connected:
+    #     logger.info("正在标定电机（从死区搜索目标 RPM）...")
+    #     fwd_pwm = motor.calibrate_pwm_for_rpm(config.target_forward_rpm)
+    #     rot_pwm = motor.calibrate_rotation_pwm(config.target_rotation_rpm)
+    #     logger.info("标定完成: 前进 PWM=%d, 旋转 PWM=%d", fwd_pwm, rot_pwm)
+    # else:
+    #     fwd_pwm = config.min_effective_pwm + 5
+    #     rot_pwm = config.min_effective_pwm + 3
+    fwd_pwm = 26
+    rot_pwm = 26
+    # 初始化经验标定 sweep，使 adapt_pwm 正常工作
+    # 数据来源：多次板端实测 PWM→RPM
+    motor.set_calib_sweep([(22, 6.0), (24, 16.0), (26, 22.0)])
+    logger.info("使用经验 PWM: 前进=%d, 旋转=%d", fwd_pwm, rot_pwm)
 
     # ── 初始化 YOLO ──
     from detector import _get_session
