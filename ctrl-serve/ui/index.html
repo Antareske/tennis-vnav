@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>网球采集控制</title>
+<style>
+  :root {
+    --bg: #101418;
+    --card: #1b222a;
+    --btn-start: #1f8a4c;
+    --btn-abort: #b3402e;
+    --btn-del: #3a4553;
+    --text: #e6ebf0;
+    --dim: #8a97a5;
+    --ok: #4fc07f;
+    --err: #e06c5a;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "PingFang SC", "Noto Sans CJK SC", sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin-bottom: 12px; color: var(--dim); }
+
+  /* ── 状态卡片 ── */
+  .status-card {
+    width: 100%;
+    max-width: 420px;
+    background: var(--card);
+    border-radius: 14px;
+    padding: 16px;
+    margin-bottom: 14px;
+  }
+  .status-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 0;
+    font-size: 15px;
+  }
+  .status-row .label { color: var(--dim); }
+  .status-row .value { font-weight: 600; }
+  .phase { display: inline-block; padding: 3px 12px; border-radius: 20px; font-size: 14px; font-weight: 700; }
+  .phase-IDLE { background: #2a3542; color: var(--dim); }
+  .phase-COLLECTING { background: #173b27; color: var(--ok); }
+  .phase-NO_NAV { background: #4a2520; color: var(--err); }
+  .error-box {
+    margin-top: 10px;
+    padding: 10px;
+    background: #4a2520;
+    border-radius: 8px;
+    color: var(--err);
+    font-size: 14px;
+    display: none;
+  }
+  .error-box.show { display: block; }
+
+  /* ── 按钮 ── */
+  .btn {
+    width: 100%;
+    max-width: 420px;
+    height: 64px;
+    border: none;
+    border-radius: 14px;
+    font-size: 20px;
+    font-weight: 700;
+    color: #fff;
+    margin-bottom: 12px;
+    cursor: pointer;
+    transition: opacity 0.1s;
+  }
+  .btn:active { opacity: 0.75; }
+  .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  .btn-start { background: var(--btn-start); }
+  .btn-abort { background: var(--btn-abort); }
+  .btn-del { background: var(--btn-del); font-size: 17px; height: 56px; }
+
+  .foot {
+    margin-top: auto;
+    color: var(--dim);
+    font-size: 12px;
+    padding: 16px 0 4px;
+  }
+</style>
+</head>
+<body>
+<h1>网球采集控制</h1>
+
+<div class="status-card">
+  <div class="status-row"><span class="label">当前轮次</span><span class="value" id="st-episode">—</span></div>
+  <div class="status-row"><span class="label">阶段</span><span class="value"><span class="phase phase-IDLE" id="st-phase">—</span></span></div>
+  <div class="status-row"><span class="label">导航状态</span><span class="value" id="st-nav">—</span></div>
+  <div class="status-row"><span class="label">已采帧数</span><span class="value" id="st-frames">—</span></div>
+  <div class="status-row"><span class="label">有效 FPS</span><span class="value" id="st-fps">—</span></div>
+  <div class="error-box" id="st-error"></div>
+</div>
+
+<button class="btn btn-start" id="btn-start">▶ 开始采集</button>
+<button class="btn btn-abort" id="btn-abort" disabled>⏹ 中止</button>
+<button class="btn btn-del" id="btn-del" disabled>🗑 删除第 — 组</button>
+
+<div class="foot">tennis-vnav · 连小车热点访问</div>
+
+<script>
+let status = null;
+
+function setPhase(phase) {
+  const el = document.getElementById('st-phase');
+  el.className = 'phase phase-' + phase;
+  el.textContent = {IDLE:'空闲', COLLECTING:'采集中', DONE:'完成', NO_NAV:'导航未运行'}[phase] || phase;
+}
+
+function render() {
+  if (!status) return;
+  const s = status;
+  const collecting = s.phase === 'COLLECTING';
+
+  document.getElementById('st-episode').textContent = s.episode_id ? '第 ' + s.episode_id + ' 组' : '—';
+  setPhase(s.phase);
+  document.getElementById('st-nav').textContent = s.nav_state || '—';
+  document.getElementById('st-frames').textContent = s.frames != null ? s.frames : '—';
+  document.getElementById('st-fps').textContent = s.effective_fps != null ? s.effective_fps.toFixed(1) : '—';
+
+  const errBox = document.getElementById('st-error');
+  if (s.error) { errBox.textContent = '⚠ ' + s.error; errBox.classList.add('show'); }
+  else { errBox.classList.remove('show'); }
+
+  document.getElementById('btn-start').disabled = collecting;
+  document.getElementById('btn-abort').disabled = !collecting;
+  const delBtn = document.getElementById('btn-del');
+  const hasData = (s.total_episodes || 0) > 0;
+  delBtn.disabled = collecting || !hasData;
+  delBtn.textContent = '🗑 删除第 ' + (s.last_episode || '—') + ' 组';
+}
+
+async function refresh() {
+  try {
+    const resp = await fetch('/status', {cache: 'no-store'});
+    status = await resp.json();
+    render();
+  } catch (e) { /* 网络瞬断忽略，下轮重试 */ }
+}
+
+async function sendCmd(cmd) {
+  try {
+    await fetch('/cmd/' + cmd, {method: 'POST'});
+  } catch (e) { /* 忽略 */ }
+  setTimeout(refresh, 300);
+}
+
+document.getElementById('btn-start').addEventListener('click', () => sendCmd('start'));
+document.getElementById('btn-abort').addEventListener('click', () => sendCmd('abort'));
+document.getElementById('btn-del').addEventListener('click', () => {
+  const n = status && status.last_episode ? status.last_episode : '';
+  if (confirm('确定删除第 ' + n + ' 组数据？此操作不可恢复。')) {
+    sendCmd('clear');
+  }
+});
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

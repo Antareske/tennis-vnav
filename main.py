@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""单目纯视觉网球导航 — 入口。
+"""单目纯视觉网球导航 — 入口（多轮数采模式）。
 
-基于 AKA-00 组件，实现：
-  SEARCH（旋转搜索）→ OBSERVE（停车观测）→ PLAN（路径规划）
-  → TRACK（连续跟踪+闭环修正）→ ALIGN（最终对准）
+工作流程：
+  启动 → IDLE（等网页"开始采集"命令）
+       → 采集一轮（0.5s 静止 → SEARCH → OBSERVE → APPROACH → DONE）
+       → 保存数据 → 回到 IDLE
+
+网页控制（ctrl-serve，http://192.168.4.1）通过 /tmp/vnav/ 文件通信：
+  cmd.txt:    start / abort / clear
+  status.json: 当前组号、阶段、帧数、FPS、错误
 
 用法:
-  python main.py                          # 使用默认配置
-  python main.py --config calib.json      # 使用标定后配置
-  python main.py --headless               # 无 GUI 模式
+  python main.py --no-collect          # 单轮模式（禁用数采，仅导航）
+  python main.py --data-dir DIR        # 数据根目录
 """
 
 import argparse
@@ -16,6 +20,7 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 
 # 确保在 tennis-vnav 目录下运行
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -26,6 +31,8 @@ from motor import MotorController
 from state_machine import TennisNavStateMachine, NavState
 from data_collector import (DataCollector, SharedSlot, Cv2JpegEncoder,
                             next_episode_id, _resolve_data_root)
+from vnav_control import (read_command, wait_command, write_status,
+                          count_episodes, delete_last_episode)
 
 # ── 日志 ──
 
@@ -51,7 +58,7 @@ def main():
     parser.add_argument("--model", type=str, default="models/tennis.onnx",
                         help="YOLO 模型路径")
     parser.add_argument("--no-collect", action="store_true",
-                        help="禁用数据采集")
+                        help="禁用数据采集（仅导航调试）")
     parser.add_argument("--data-dir", type=str, default=None,
                         help="数据采集输出根目录（默认 data/）")
     args = parser.parse_args()
@@ -83,7 +90,6 @@ def main():
     except Exception as e:
         logger.error("摄像头初始化失败: %s", e)
         sys.exit(1)
-
     logger.info("摄像头已就绪: %dx%d @ %dfps",
                 config.img_width, config.img_height, config.camera_fps)
 
@@ -97,27 +103,14 @@ def main():
         min_effective_pwm=config.min_effective_pwm,
         max_pwm=config.max_pwm,
     )
-
     if not motor.connect():
         logger.warning("电机连接失败，将在模拟模式下运行")
     else:
         logger.info("电机已连接: %s", args.motor_port)
 
-    # ── 电机标定（使用经验 PWM 值，跳过动态扫描）──
-    # 经验值：PWM=26 对应 ~18 RPM 前进，PWM=26 对应 ~14 RPM 旋转差速
-    # 若需动态标定，取消注释下面代码：
-    # if motor.is_connected:
-    #     logger.info("正在标定电机（从死区搜索目标 RPM）...")
-    #     fwd_pwm = motor.calibrate_pwm_for_rpm(config.target_forward_rpm)
-    #     rot_pwm = motor.calibrate_rotation_pwm(config.target_rotation_rpm)
-    #     logger.info("标定完成: 前进 PWM=%d, 旋转 PWM=%d", fwd_pwm, rot_pwm)
-    # else:
-    #     fwd_pwm = config.min_effective_pwm + 5
-    #     rot_pwm = config.min_effective_pwm + 3
+    # ── 电机标定（经验 PWM）──
     fwd_pwm = 26
     rot_pwm = 26
-    # 初始化经验标定 sweep，使 adapt_pwm 正常工作
-    # 数据来源：多次板端实测 PWM→RPM
     motor.set_calib_sweep([(22, 6.0), (24, 16.0), (26, 22.0)])
     logger.info("使用经验 PWM: 前进=%d, 旋转=%d", fwd_pwm, rot_pwm)
 
@@ -125,130 +118,172 @@ def main():
     from detector import _get_session
     session, input_name = _get_session(config.model_path)
 
-    # ── 初始化状态机 ──
-    sm = TennisNavStateMachine(
-        config=config,
-        motor=motor,
-        session=session,
-        model_path=config.model_path,
-    )
-    sm.set_calibrated_pwm(fwd_pwm, rot_pwm)
+    # ── 清理旧命令文件，准备控制接口 ──
+    try:
+        os.remove("/tmp/vnav/cmd.txt")
+    except OSError:
+        pass
+    data_root = _resolve_data_root(args.data_dir)
+    last_episode_id = next_episode_id(data_root) - 1 if data_root.exists() else 0
 
-    # ── 数据采集（独立线程，硬件 VENC 编码）──
-    collector = None
-    action_slot = SharedSlot()  # 主循环每 tick 写入的 action 槽
-    if not args.no_collect:
-        data_root = _resolve_data_root(args.data_dir)
-        episode_id = next_episode_id(data_root)
-        episode_dir = data_root / f"episode_{episode_id:03d}"
+    def push_status(phase: str, **extra):
+        """写入状态文件。"""
+        st = {
+            "phase": phase,
+            "episode_id": extra.get("episode_id"),
+            "last_episode": last_episode_id,
+            "total_episodes": count_episodes(data_root),
+            "nav_state": extra.get("nav_state"),
+            "frames": extra.get("frames", 0),
+            "effective_fps": extra.get("effective_fps"),
+            "error": extra.get("error"),
+        }
+        write_status(st)
 
-        # 编码器：优先硬件 VENC，失败回退软件 cv2
-        try:
-            from hwjpeg_enc import HwJpegEncoder
-            encoder = HwJpegEncoder(
-                width=config.img_width, height=config.img_height, quality=60)
-        except Exception as e:
-            logger.warning("VENC 硬件编码不可用 (%s)，回退软件编码", e)
-            encoder = Cv2JpegEncoder()
-
-        collector = DataCollector(output_dir=episode_dir, fps=10, encoder=encoder)
-        collector.start_async(camera, motor, action_slot)
-
-        # 导航前静止采样 0.5s（action 槽默认 (0,0)，线程自动采样）
-        logger.info("导航前静止采样 0.5s...")
-        time.sleep(0.5)
-    else:
-        logger.info("数据采集已禁用")
-
-    # ── 主循环 ──
-    # 状态机 tick 限频：YOLO 推理 ~84ms 是 CPU 大头，
-    # 限制到 ~6.7 Hz（150ms），把 CPU 让给数采线程保证 10 FPS 采样。
-    # 导航在 3-7 FPS 下已验证可用，低 tick 率不影响行驶质量。
-    logger.info("开始导航主循环...")
-    frame_count = 0
-    fps_update_time = time.time()
-    fps_frame_count = 0
-    tick_interval = 0.15
-    last_tick_time = 0.0
-    last_frame_ts = -1.0
+    logger.info("就绪，等待网页命令 (http://192.168.4.1)...")
 
     try:
-        camera_error_count = 0
-        while not sm.is_done():
-            loop_start = time.time()
+        while True:
+            # ══════════ IDLE：等待 start 命令 ══════════
+            push_status("IDLE")
+            logger.info("── 空闲：等待开始采集命令 ──")
+            while True:
+                cmd = wait_command(0.5)
+                if cmd == "start":
+                    break
+                elif cmd == "clear":
+                    deleted = delete_last_episode(data_root)
+                    last_episode_id = next_episode_id(data_root) - 1 if data_root.exists() else 0
+                    logger.info("clear 完成，最近组: %d", last_episode_id)
+                    push_status("IDLE")
+                elif cmd == "abort":
+                    # 空闲阶段的中止无意义，忽略
+                    pass
 
-            # 读取帧（带断连重试）— BGR 供 YOLO 使用
-            ret, frame = camera.read_bgr()
-            if not ret or frame is None:
-                camera_error_count += 1
-                if camera_error_count > 30:  # ~2s 无帧，尝试重连
-                    logger.warning("摄像头无数据，尝试重连...")
-                    if camera.reconnect():
-                        logger.info("摄像头重连成功")
-                        camera_error_count = 0
-                        continue
-                    else:
-                        logger.error("摄像头重连失败，退出")
+            # ══════════ COLLECTING：采集一轮 ══════════
+            episode_id = next_episode_id(data_root)
+            episode_dir = data_root / f"episode_{episode_id:03d}"
+            logger.info("── 第 %d 组采集开始: %s ──", episode_id, episode_dir)
+
+            action_slot = SharedSlot()
+
+            # 编码器（硬件 VENC 失败回退软件）
+            if not args.no_collect:
+                try:
+                    from hwjpeg_enc import HwJpegEncoder
+                    encoder = HwJpegEncoder(
+                        width=config.img_width, height=config.img_height, quality=60)
+                except Exception as e:
+                    logger.warning("VENC 硬件编码不可用 (%s)，回退软件编码", e)
+                    encoder = Cv2JpegEncoder()
+                collector = DataCollector(output_dir=episode_dir, fps=10, encoder=encoder)
+                collector.start_async(camera, motor, action_slot)
+                time.sleep(0.5)  # 导航前静止采样
+            else:
+                collector = None
+
+            # 每集新状态机（清空位姿估计与状态）
+            sm = TennisNavStateMachine(
+                config=config,
+                motor=motor,
+                session=session,
+                model_path=config.model_path,
+            )
+            sm.set_calibrated_pwm(fwd_pwm, rot_pwm)
+
+            aborted = False
+            error_msg = None
+            frame_count = 0
+            last_tick_time = 0.0
+            last_frame_ts = -1.0
+            last_status_time = 0.0
+            fps_update_time = time.time()
+            fps_frame_count = 0
+
+            try:
+                while not sm.is_done():
+                    # 命令检查（每帧，非阻塞）
+                    cmd = read_command()
+                    if cmd == "abort":
+                        aborted = True
+                        logger.info("收到中止命令")
                         break
-                time.sleep(0.01)
-                continue
-            camera_error_count = 0
+                    elif cmd == "start" or cmd == "clear":
+                        # 采集中忽略这两个命令
+                        pass
 
-            frame_count += 1
+                    # 读取帧（带断连重试）
+                    ret, frame = camera.read_bgr()
+                    if not ret or frame is None:
+                        time.sleep(0.01)
+                        continue
+                    frame_count += 1
 
-            # 限频 + 去重：同帧不重复推理，间隔不足跳过本帧
-            now = time.time()
-            if camera.frame_ts == last_frame_ts or now - last_tick_time < tick_interval:
-                time.sleep(0.01)
-                continue
-            last_frame_ts = camera.frame_ts
-            last_tick_time = now
+                    # 限频 + 去重：同帧不重复推理
+                    now = time.time()
+                    if camera.frame_ts == last_frame_ts or now - last_tick_time < 0.15:
+                        time.sleep(0.01)
+                        continue
+                    last_frame_ts = camera.frame_ts
+                    last_tick_time = now
 
-            # 状态机 tick
-            left_pwm, right_pwm = sm.tick(frame)
-            fps_frame_count += 1
+                    # 状态机 tick
+                    left_pwm, right_pwm = sm.tick(frame)
+                    action_slot.set(left_pwm, right_pwm)
+                    fps_frame_count += 1
 
-            # 更新 action 槽（数采线程自行采样）
-            action_slot.set(left_pwm, right_pwm)
+                    # FPS 显示
+                    if now - fps_update_time >= 2.0:
+                        fps = fps_frame_count / (now - fps_update_time)
+                        logger.info("%s | FPS=%.1f | PWM=(%d, %d)",
+                                    sm.status_text, fps, left_pwm, right_pwm)
+                        fps_update_time = now
+                        fps_frame_count = 0
 
-            # FPS 显示
-            if now - fps_update_time >= 2.0:
-                fps = fps_frame_count / (now - fps_update_time)
-                logger.info("%s | FPS=%.1f | PWM=(%d, %d)",
-                            sm.status_text, fps, left_pwm, right_pwm)
-                fps_update_time = now
-                fps_frame_count = 0
+                    # 状态推送（~1Hz）
+                    if now - last_status_time >= 1.0:
+                        last_status_time = now
+                        push_status("COLLECTING",
+                                    episode_id=episode_id,
+                                    nav_state=sm.state.name,
+                                    frames=collector.frame_count if collector else 0)
 
-            # 帧率控制
-            elapsed = time.time() - loop_start
-            target_interval = 1.0 / config.camera_fps
-            if elapsed < target_interval:
-                time.sleep(target_interval - elapsed)
+                # 正常完成 → 导航后静止采样 1s
+                if not aborted:
+                    action_slot.set(0, 0)
+                    if collector is not None:
+                        logger.info("导航完成，导航后静止采样 1s...")
+                        time.sleep(1.0)
+            except Exception as e:
+                logger.exception("主循环异常: %s", e)
+                error_msg = f"{e}"
 
-        logger.info("导航完成！小车已到达目标位置。")
-
-        # 导航后静止采样 1s（action 槽归零，线程自动采样刹停过程）
-        if collector is not None:
-            logger.info("导航后静止采样 1s...")
+            # ── 收尾 ──
+            motor.brake()
             action_slot.set(0, 0)
-            time.sleep(1.0)
+            if collector is not None:
+                count = collector.stop()
+                if count > 0:
+                    logger.info("数据已保存到: %s (%d 帧)", collector.output_dir, count)
+            last_episode_id = episode_id
+
+            if aborted:
+                logger.info("第 %d 组已中止（数据已保存）", episode_id)
+            elif error_msg:
+                logger.error("第 %d 组异常结束: %s", episode_id, error_msg)
+                push_status("IDLE", episode_id=episode_id, error=f"第 {episode_id} 组出错: {error_msg}")
+            else:
+                logger.info("第 %d 组完成", episode_id)
+
     except KeyboardInterrupt:
         logger.info("用户中断")
-    except Exception as e:
-        logger.exception("主循环异常: %s", e)
     finally:
-        # ── 停止数据采集 ──
-        if collector is not None:
-            count = collector.stop()
-            if count > 0:
-                logger.info("数据已保存到: %s (%d 帧)", collector.output_dir, count)
-
         # ── 清理 ──
         logger.info("正在停止...")
         motor.brake()
         motor.close()
         camera.release()
-        logger.info("已停止，共处理 %d 帧", frame_count)
+        logger.info("已停止")
 
 
 if __name__ == "__main__":
