@@ -294,6 +294,25 @@ class MotorController:
                 return 0, 0
         return 0, 0
 
+    def get_speeds_cached(self, max_age: float = 0.15) -> tuple[int, int]:
+        """返回缓存 RPM（若新鲜），否则主动查询。
+
+        用于同 tick 内重复读取（如补偿查询后数采再查），
+        避免同一 tick 内两次 UART 查询浪费主循环时间。
+
+        Args:
+            max_age: 缓存最大年龄 (s)
+
+        Returns:
+            (left_rpm, right_rpm)
+        """
+        if self.is_connected:
+            try:
+                return self._chassis.get_cached_rpm(max_age)
+            except Exception:
+                return 0, 0
+        return 0, 0
+
     def get_encoder(self) -> tuple[int, int]:
         """读取编码器累计脉冲。"""
         if self.is_connected:

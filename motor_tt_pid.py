@@ -2,6 +2,7 @@
 
 import os
 import struct
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -71,6 +72,14 @@ class TtPidChassis:
         time.sleep(0.5)
         self.ser.reset_input_buffer()
 
+        # 串行化所有 UART 访问：多线程并发读写同一串口会导致
+        # reset_input_buffer 清掉其他线程正在等待的响应帧
+        self._serial_lock = threading.Lock()
+
+        # RPM 缓存：仅在查询成功时更新
+        self._cached_rpm: tuple[int, int] = (0, 0)
+        self._cached_rpm_ts: float = 0.0
+
         if not self._init():
             raise RuntimeError("ESP32 init failed")
         if not self._config(ppr, pwm_freq):
@@ -118,15 +127,17 @@ class TtPidChassis:
         return None
 
     def _send_cmd(self, cmd: int, payload: bytes = b"", timeout: float = 0.2) -> Optional[dict]:
-        self.ser.reset_input_buffer()
-        self.ser.write(self._build_frame(cmd, payload))
-        self.ser.flush()
-        return self._recv_frame(timeout)
+        with self._serial_lock:
+            self.ser.reset_input_buffer()
+            self.ser.write(self._build_frame(cmd, payload))
+            self.ser.flush()
+            return self._recv_frame(timeout)
 
     def _send_cmd_noresp(self, cmd: int, payload: bytes = b"") -> None:
         """Fire-and-forget: 发送指令但不等待回复，避免阻塞事件循环。"""
-        self.ser.write(self._build_frame(cmd, payload))
-        self.ser.flush()
+        with self._serial_lock:
+            self.ser.write(self._build_frame(cmd, payload))
+            self.ser.flush()
 
     def _init(self) -> bool:
         rsp = self._send_cmd(CMD_INIT)
@@ -165,26 +176,49 @@ class TtPidChassis:
         self._send_cmd_noresp(CMD_STOP, bytes([2]))
 
     def get_rpm(self) -> Optional[RpmData]:
-        """获取左右轮 RPM（mid=2 返回两个电机数据帧）。"""
-        self.ser.reset_input_buffer()
-        self.ser.write(self._build_frame(CMD_GET_RPM, bytes([2])))
-        self.ser.flush()
+        """获取左右轮 RPM（mid=2 返回两个电机数据帧）。
 
-        left, right = 0, 0
-        # mid=2 会连续返回两个帧
-        for _ in range(2):
-            rsp = self._recv_frame(timeout=0.1)
-            if rsp is None or rsp["cmd"] != RSP_RPM_DATA:
-                return None
-            payload = rsp["payload"]
-            if len(payload) >= 3:
-                mid = payload[0]
-                rpm = struct.unpack(">h", payload[1:3])[0]
-                if mid == 0:
-                    right = rpm
-                elif mid == 1:
-                    left = rpm
-        return RpmData(left=left, right=right)
+        全程持锁，防止其他线程的 reset_input_buffer 清掉响应帧。
+        查询成功时更新缓存（仅成功才更新，失败保留旧值）。
+        """
+        with self._serial_lock:
+            self.ser.reset_input_buffer()
+            self.ser.write(self._build_frame(CMD_GET_RPM, bytes([2])))
+            self.ser.flush()
+
+            left, right = 0, 0
+            # mid=2 会连续返回两个帧
+            for _ in range(2):
+                rsp = self._recv_frame(timeout=0.1)
+                if rsp is None or rsp["cmd"] != RSP_RPM_DATA:
+                    return None
+                payload = rsp["payload"]
+                if len(payload) >= 3:
+                    mid = payload[0]
+                    rpm = struct.unpack(">h", payload[1:3])[0]
+                    if mid == 0:
+                        right = rpm
+                    elif mid == 1:
+                        left = rpm
+            self._cached_rpm = (left, right)
+            self._cached_rpm_ts = time.monotonic()
+            return RpmData(left=left, right=right)
+
+    def get_cached_rpm(self, max_age: float = 0.15) -> tuple[int, int]:
+        """返回缓存 RPM（若新鲜），否则主动查询一次。
+
+        Args:
+            max_age: 缓存最大年龄 (s)。超过则重新查询。
+
+        Returns:
+            (left_rpm, right_rpm)
+        """
+        if time.monotonic() - self._cached_rpm_ts <= max_age:
+            return self._cached_rpm
+        rpm = self.get_rpm()
+        if rpm is None:
+            return self._cached_rpm
+        return rpm.left, rpm.right
 
     def reset(self) -> bool:
         """重置控制器。"""
