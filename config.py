@@ -36,7 +36,7 @@ class NavConfig:
 
     # ── RPM 速度目标（替代未标定的 m/s，直接对标电机实测）──
     target_forward_rpm: float = 18.0   # 前进目标 RPM
-    target_rotation_rpm: float = 10.0   # 旋转目标 RPM
+    target_rotation_rpm: float = 14.0   # 旋转目标 RPM（调高以增强差速转向）
 
     # ── 搜索阶段 ──
     search_rotation_pwm: int = 22   # 搜索旋转起始 PWM（≈ 死区值，由自动标定覆盖）

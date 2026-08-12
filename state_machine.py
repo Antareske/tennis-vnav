@@ -1,11 +1,9 @@
 """视觉导航状态机。
 
 状态流转：
-  SEARCH → OBSERVE → PLAN → TRACK → ALIGN (终止)
-    ↑        ↑         ↑        │        │
-    └── ball lost ──────┘        │        │
-                     └── re-plan ┘        │
-                                └── ball lost → SEARCH
+  SEARCH → OBSERVE → APPROACH → DONE
+    ↑                      │
+    └── 丢球超时 ──────────┘
 """
 
 from __future__ import annotations
@@ -156,14 +154,13 @@ class TennisNavStateMachine:
         margin = self.config.bbox_edge_margin
 
         # 搜索阶段放宽边缘检查：球只需大部分在画面内即可
-        search_margin = max(5, margin // 4)  # 5px 而不是 20px
+        search_margin = max(5, margin // 4)
         if self._current_bbox and is_bbox_valid(self._current_bbox, img_w, img_h, search_margin):
             self._search_confirm_count += 1
             logger.info("SEARCH: 检测到完整网球 (%d/%d)",
                         self._search_confirm_count, self.config.search_confirm_frames)
 
             if self._search_confirm_count >= self.config.search_confirm_frames:
-                # 确认发现，刹车进入观测
                 logger.info("SEARCH → OBSERVE")
                 self.motor.brake()
                 self._search_confirm_count = 0
@@ -216,7 +213,7 @@ class TennisNavStateMachine:
             # 估计不可靠（太远等），前进一段再搜索
             logger.info("OBSERVE: 位姿估计不可靠，前进探索")
             pwm = self.config.min_effective_pwm + 10
-            self.motor.set_speed(pwm, pwm)
+            self.motor.set_raw_speed(pwm, pwm)
             time.sleep(0.5)
             self.motor.brake()
             self._transition(NavState.SEARCH)
@@ -250,13 +247,12 @@ class TennisNavStateMachine:
     # ── APPROACH ──
 
     def _handle_approach(self, frame: np.ndarray) -> tuple[int, int]:
-        """简单可靠的接近策略：转向球 → 直线前进 → 到达停止。"""
+        """简单可靠的接近策略：始终前进 + 纯差速转向。"""
         if self._current_bbox is None:
             self._ball_lost_count += 1
-            # 丢球时立即刹车
             if self._ball_lost_count == 1:
                 self.motor.brake()
-            # 等待 ~1.5s (约 20 帧) 尝试重新捕获，不要急于 SEARCH
+            # 等待 ~1.5s (约 20 帧) 尝试重新捕获
             if self._ball_lost_count > 20:
                 logger.warning("APPROACH: 丢失网球超时，回到 SEARCH")
                 self._transition(NavState.SEARCH)
@@ -277,29 +273,16 @@ class TennisNavStateMachine:
             self._transition(NavState.DONE)
             return 0, 0
 
-        # 计算到球的方位角
-        angle_deg = math.degrees(math.atan2(ball_x, ball_z))
         fwd = self._calibrated_fwd_pwm
-        rot = self._calibrated_rot_pwm
 
-        # 纯差速转向修正（不再有角度阈值，始终前进 + 差速）
-        #
-        # [已注释] 旧方案：角度 > 12° 时原地旋转
-        #   if abs(angle_deg) > 12:
-        #       self.motor.set_raw_speed(rot, -rot)  # 原地转
-        #   else:
-        #       lateral_pwm = int(abs(ball_x) * 60.0)  # 直线+微调
-        #
         # 基础修正：横向偏差 → PWM 差异
         base_correction = int(abs(ball_x) * 80.0)
 
         # 偏差累积：如果车没有在纠正（偏差方向不变），逐步增大差速
         cur_sign = 1 if ball_x > 0 else -1
         if cur_sign == self._prev_ball_x_sign and self._prev_ball_x_sign != 0:
-            # 偏差方向不变 → 差速不够，累积 escalate
             self._lateral_error_accum += abs(ball_x) * 0.15
         else:
-            # 偏差方向变了 → 已纠正过头，重置
             self._lateral_error_accum = 0.0
         self._prev_ball_x_sign = cur_sign
 

@@ -24,6 +24,7 @@ from config import NavConfig, CALIB_FILE
 from camera import Camera
 from motor import MotorController
 from state_machine import TennisNavStateMachine, NavState
+from data_collector import DataCollector, next_episode_id, _resolve_data_root
 
 # ── 日志 ──
 
@@ -67,6 +68,10 @@ def main():
                         help="电机串口路径")
     parser.add_argument("--model", type=str, default="models/tennis.onnx",
                         help="YOLO 模型路径")
+    parser.add_argument("--no-collect", action="store_true",
+                        help="禁用数据采集")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="数据采集输出根目录（默认 data/）")
     args = parser.parse_args()
 
     # 加载配置
@@ -143,6 +148,17 @@ def main():
     )
     sm.set_calibrated_pwm(fwd_pwm, rot_pwm)
 
+    # ── 数据采集 ──
+    collector = None
+    if not args.no_collect:
+        data_root = _resolve_data_root(args.data_dir)
+        episode_id = next_episode_id(data_root)
+        episode_dir = data_root / f"episode_{episode_id:03d}"
+        collector = DataCollector(output_dir=episode_dir, fps=10)
+        collector.start()
+    else:
+        logger.info("数据采集已禁用")
+
     # ── 主循环 ──
     logger.info("开始导航主循环...")
     frame_count = 0
@@ -177,6 +193,12 @@ def main():
             # 状态机 tick
             left_pwm, right_pwm = sm.tick(frame)
 
+            # 数据采集 (10 FPS)
+            if collector is not None and collector.should_sample():
+                left_rpm, right_rpm = motor.get_speeds()
+                collector.add(frame.copy(), (left_rpm, right_rpm),
+                             (left_pwm, right_pwm))
+
             # FPS 显示
             now = time.time()
             if now - fps_update_time >= 2.0:
@@ -198,6 +220,12 @@ def main():
     except Exception as e:
         logger.exception("主循环异常: %s", e)
     finally:
+        # ── 停止数据采集 ──
+        if collector is not None:
+            count = collector.stop()
+            if count > 0:
+                logger.info("数据已保存到: %s (%d 帧)", collector.output_dir, count)
+
         # ── 清理 ──
         logger.info("正在停止...")
         motor.brake()

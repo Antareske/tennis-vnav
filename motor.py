@@ -4,6 +4,7 @@
 - 死区补偿（参考 akars map_deadzone）
 - 差速运动学解算（线速度/角速度 → 左右 PWM）
 - 高级控制接口（前进、转向、刹车、怠速）
+- PWM 自动标定（PWM→RPM 扫描）
 
 不直接使用 tennis_hunter.py 已删除的 N20 类。
 """
@@ -88,7 +89,6 @@ def diff_drive_to_pwm(
     right_wheel_vel = linear_vel - angular_vel * half_base  # m/s
 
     # 轮速 → 角速度 (rad/s) → PWM
-    # PWM 比例 = wheel_vel / (max_linear_speed), 映射到 [0, max_pwm]
     left_raw = int(left_wheel_vel / max_linear_speed * max_pwm)
     right_raw = int(right_wheel_vel / max_linear_speed * max_pwm)
 
@@ -155,7 +155,7 @@ class MotorController:
         self._chassis.set_speed(lp, rp)
 
     def set_raw_speed(self, left: int, right: int) -> None:
-        """直接设置 PWM（无死区补偿，用于标定测试）。"""
+        """直接设置 PWM（无死区补偿，用于标定后的精确控制）。"""
         if not self.is_connected:
             return
         self._chassis.set_speed(left, right)
@@ -232,7 +232,7 @@ class MotorController:
         return 0, 0
 
     def calibrate_pwm_for_rpm(self, target_rpm: float, timeout_s: float = 1.0) -> int:
-        """从死区开始逐步增大 PWM，找到恰好达到 target_rpm 的 PWM 值。
+        """从死区开始逐步增大 PWM，找到达到 target_rpm 的 PWM 值。
 
         对标定后的速度控制至关重要：不依赖未标定的 max_linear_speed，
         直接测量 PWM→RPM 映射。
@@ -248,12 +248,10 @@ class MotorController:
             return self.min_effective_pwm + 5
 
         import time as _time
-        # 从死区开始搜索
         for pwm in range(self.min_effective_pwm, self.max_pwm + 1, 2):
             self._chassis.set_speed(pwm, pwm)
             _time.sleep(timeout_s)
 
-            # 采样 RPM
             left_samples, right_samples = [], []
             t0 = _time.time()
             while _time.time() - t0 < 0.3:
