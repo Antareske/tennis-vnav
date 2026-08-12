@@ -24,7 +24,8 @@ from config import NavConfig, CALIB_FILE
 from camera import Camera
 from motor import MotorController
 from state_machine import TennisNavStateMachine, NavState
-from data_collector import DataCollector, next_episode_id, _resolve_data_root
+from data_collector import (DataCollector, SharedSlot, Cv2JpegEncoder,
+                            next_episode_id, _resolve_data_root)
 
 # ── 日志 ──
 
@@ -33,25 +34,6 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 logger = logging.getLogger("tennis-nav")
-
-
-# ── 状态采集线程 ──
-
-from state_collector import get_state_collector
-
-
-def start_state_collector(motor: MotorController, config: NavConfig):
-    """启动独立状态采集线程（保留 AKA-00 功能，可扩展为指定频率采集）。"""
-    collector = get_state_collector()
-    collector.set_motor_pair(motor._chassis if motor.is_connected else None)
-    collector.start()
-    logger.info("状态采集线程已启动 (%d fps)", config.state_collect_fps)
-
-
-def stop_state_collector():
-    collector = get_state_collector()
-    collector.stop()
-    logger.info("状态采集线程已停止")
 
 
 # ── 主循环 ──
@@ -121,9 +103,6 @@ def main():
     else:
         logger.info("电机已连接: %s", args.motor_port)
 
-    # ── 启动状态采集 ──
-    start_state_collector(motor, config)
-
     # ── 电机标定（使用经验 PWM 值，跳过动态扫描）──
     # 经验值：PWM=26 对应 ~18 RPM 前进，PWM=26 对应 ~14 RPM 旋转差速
     # 若需动态标定，取消注释下面代码：
@@ -155,22 +134,43 @@ def main():
     )
     sm.set_calibrated_pwm(fwd_pwm, rot_pwm)
 
-    # ── 数据采集 ──
+    # ── 数据采集（独立线程，硬件 VENC 编码）──
     collector = None
+    action_slot = SharedSlot()  # 主循环每 tick 写入的 action 槽
     if not args.no_collect:
         data_root = _resolve_data_root(args.data_dir)
         episode_id = next_episode_id(data_root)
         episode_dir = data_root / f"episode_{episode_id:03d}"
-        collector = DataCollector(output_dir=episode_dir, fps=10)
-        collector.start()
+
+        # 编码器：优先硬件 VENC，失败回退软件 cv2
+        try:
+            from hwjpeg_enc import HwJpegEncoder
+            encoder = HwJpegEncoder(
+                width=config.img_width, height=config.img_height, quality=60)
+        except Exception as e:
+            logger.warning("VENC 硬件编码不可用 (%s)，回退软件编码", e)
+            encoder = Cv2JpegEncoder()
+
+        collector = DataCollector(output_dir=episode_dir, fps=10, encoder=encoder)
+        collector.start_async(camera, motor, action_slot)
+
+        # 导航前静止采样 0.5s（action 槽默认 (0,0)，线程自动采样）
+        logger.info("导航前静止采样 0.5s...")
+        time.sleep(0.5)
     else:
         logger.info("数据采集已禁用")
 
     # ── 主循环 ──
+    # 状态机 tick 限频：YOLO 推理 ~84ms 是 CPU 大头，
+    # 限制到 ~6.7 Hz（150ms），把 CPU 让给数采线程保证 10 FPS 采样。
+    # 导航在 3-7 FPS 下已验证可用，低 tick 率不影响行驶质量。
     logger.info("开始导航主循环...")
     frame_count = 0
     fps_update_time = time.time()
     fps_frame_count = 0
+    tick_interval = 0.15
+    last_tick_time = 0.0
+    last_frame_ts = -1.0
 
     try:
         camera_error_count = 0
@@ -195,19 +195,23 @@ def main():
             camera_error_count = 0
 
             frame_count += 1
-            fps_frame_count += 1
+
+            # 限频 + 去重：同帧不重复推理，间隔不足跳过本帧
+            now = time.time()
+            if camera.frame_ts == last_frame_ts or now - last_tick_time < tick_interval:
+                time.sleep(0.01)
+                continue
+            last_frame_ts = camera.frame_ts
+            last_tick_time = now
 
             # 状态机 tick
             left_pwm, right_pwm = sm.tick(frame)
+            fps_frame_count += 1
 
-            # 数据采集 (10 FPS)
-            if collector is not None and collector.should_sample():
-                left_rpm, right_rpm = motor.get_speeds()
-                collector.add(frame.copy(), (left_rpm, right_rpm),
-                             (left_pwm, right_pwm))
+            # 更新 action 槽（数采线程自行采样）
+            action_slot.set(left_pwm, right_pwm)
 
             # FPS 显示
-            now = time.time()
             if now - fps_update_time >= 2.0:
                 fps = fps_frame_count / (now - fps_update_time)
                 logger.info("%s | FPS=%.1f | PWM=(%d, %d)",
@@ -222,6 +226,12 @@ def main():
                 time.sleep(target_interval - elapsed)
 
         logger.info("导航完成！小车已到达目标位置。")
+
+        # 导航后静止采样 1s（action 槽归零，线程自动采样刹停过程）
+        if collector is not None:
+            logger.info("导航后静止采样 1s...")
+            action_slot.set(0, 0)
+            time.sleep(1.0)
     except KeyboardInterrupt:
         logger.info("用户中断")
     except Exception as e:
@@ -237,7 +247,6 @@ def main():
         logger.info("正在停止...")
         motor.brake()
         motor.close()
-        stop_state_collector()
         camera.release()
         logger.info("已停止，共处理 %d 帧", frame_count)
 

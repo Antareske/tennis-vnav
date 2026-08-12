@@ -123,6 +123,12 @@ class Camera:
                 return False, None
             return True, self._frame
 
+    @property
+    def frame_ts(self) -> float:
+        """当前最新帧的采集时刻（monotonic），用于同帧去重。"""
+        with self._frame_lock:
+            return self._frame_ts
+
     def release(self):
         """释放摄像头资源"""
         self._running = False

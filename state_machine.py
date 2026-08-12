@@ -86,6 +86,7 @@ class TennisNavStateMachine:
         self._calibrated_rot_pwm: int = 0   # 标定后的旋转 PWM
         self._lateral_error_accum: float = 0.0  # 横向偏差累积（差速不足时递增）
         self._prev_ball_x_sign: int = 0         # 上一帧球在左(-1)还是右(+1)
+        self._last_adapt_query: float = 0.0     # 上次 RPM 查询时刻（限频用）
 
         # 当前 bbox（跨状态共享）
         self._current_bbox: Optional[dict] = None
@@ -306,8 +307,15 @@ class TennisNavStateMachine:
         rp = max(deadzone, rp)
 
         # ── PWM 自适应（掉电补偿 + 打滑补偿，严格上限）──
+        # RPM 查询限频：每 150ms 查询一次（串口往返 28ms，避免占用主循环），
+        # 中间帧复用缓存值
         abs_max = self._calibrated_fwd_pwm + 8  # 硬上限：标定值+8
-        actual_l, actual_r = self.motor.get_speeds()
+        now = time.time()
+        if now - self._last_adapt_query >= 0.15:
+            actual_l, actual_r = self.motor.get_speeds()
+            self._last_adapt_query = now
+        else:
+            actual_l, actual_r = self.motor.get_speeds_cached(max_age=1.0)
         lp = self.motor.adapt_pwm(lp, actual_l, max_pwm=abs_max)
         rp = self.motor.adapt_pwm(rp, actual_r, max_pwm=abs_max)
 
