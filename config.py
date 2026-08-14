@@ -37,7 +37,7 @@ class NavConfig:
 
     # ── 电机经验标定（板端实测值；无运行时标定环节，见 main.py）──
     calib_fwd_pwm: int = 26         # 前进经验 PWM
-    calib_rot_pwm: int = 26         # 旋转经验 PWM
+    calib_rot_pwm: int = 24         # 旋转经验 PWM（SEARCH 自转，26→24 略降转速）
     calib_sweep: tuple = ((22, 6.0), (24, 16.0), (26, 22.0))  # PWM→RPM 标定表
 
     # ── RPM 速度目标（替代未标定的 m/s，直接对标电机实测）──
