@@ -11,6 +11,7 @@
 
 import logging
 import math
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -58,11 +59,13 @@ def diff_drive_to_pwm(
     wheel_base_m: float = 0.10,
     wheel_diameter_m: float = 0.062,
     max_linear_speed: float = 0.3,
-    max_angular_speed: float = 30.0,
+    max_angular_speed: float = 0.349,
     min_effective_pwm: int = 15,
     max_pwm: int = 100,
 ) -> tuple[int, int]:
     """差速运动学解算 + 死区补偿。
+
+    单位契约：角速度一律 rad/s（含 max_angular_speed 参数与限幅）。
 
     Args:
         linear_vel: 线速度 (m/s)
@@ -114,7 +117,7 @@ class MotorController:
         wheel_base_m: float = 0.10,
         wheel_diameter_m: float = 0.062,
         max_linear_speed: float = 0.3,
-        max_angular_speed: float = 30.0,
+        max_angular_speed: float = 0.349,
         min_effective_pwm: int = 15,
         max_pwm: int = 100,
     ):
@@ -123,13 +126,16 @@ class MotorController:
         self.wheel_base_m = wheel_base_m
         self.wheel_diameter_m = wheel_diameter_m
         self.max_linear_speed = max_linear_speed
-        self.max_angular_speed = math.radians(max_angular_speed)
+        # 单位契约：max_angular_speed 一律 rad/s（不再隐式转换）
+        self.max_angular_speed = max_angular_speed
         self.min_effective_pwm = min_effective_pwm
         self.max_pwm = max_pwm
         self._connected = False
 
         # 标定扫描数据 [(pwm, rpm), ...] 用于运行时 PWM 自适应
         self._calib_sweep: list[tuple[int, float]] = []
+        # RPM 查询失败限频日志
+        self._last_fail_log = 0.0
 
     def set_calib_sweep(self, sweep: list[tuple[int, float]]) -> None:
         """保存标定扫描数据，供 expected_rpm() / adapt_pwm() 使用。"""
@@ -141,10 +147,13 @@ class MotorController:
             return 0.0
         pwm_abs = abs(pwm)
         sweep = self._calib_sweep
-        # 边界
+        # 边界（低于最小点按比例缩放）
         if pwm_abs <= sweep[0][0]:
             frac = pwm_abs / max(1, sweep[0][0])
             return frac * sweep[0][1]
+        # 单点 sweep 无法外推，直接返回该点值（防御：sweep[-2] 会越界）
+        if len(sweep) < 2:
+            return float(sweep[0][1])
         if pwm_abs >= sweep[-1][0]:
             # 外推
             extra = pwm_abs - sweep[-1][0]
@@ -153,7 +162,10 @@ class MotorController:
         # 插值
         for i in range(len(sweep) - 1):
             if sweep[i][0] <= pwm_abs <= sweep[i + 1][0]:
-                frac = (pwm_abs - sweep[i][0]) / (sweep[i + 1][0] - sweep[i][0])
+                denom = sweep[i + 1][0] - sweep[i][0]
+                if denom <= 0:
+                    continue  # 防御：重复点不插值
+                frac = (pwm_abs - sweep[i][0]) / denom
                 return sweep[i][1] + frac * (sweep[i + 1][1] - sweep[i][1])
         return 0.0
 
@@ -233,7 +245,10 @@ class MotorController:
         self._chassis.set_speed(left, right)
 
     def drive(self, linear_vel: float, angular_vel: float) -> None:
-        """差速驱动（线速度 m/s, 角速度 rad/s）。"""
+        """差速驱动（线速度 m/s, 角速度 rad/s）。
+
+        运动学解算已含死区补偿，直接下发原始 PWM（避免 set_speed 二次补偿）。
+        """
         left, right = diff_drive_to_pwm(
             linear_vel, angular_vel,
             wheel_base_m=self.wheel_base_m,
@@ -243,7 +258,7 @@ class MotorController:
             min_effective_pwm=self.min_effective_pwm,
             max_pwm=self.max_pwm,
         )
-        self.set_speed(left, right)
+        self.set_raw_speed(left, right)
 
     def forward(self, speed: float) -> None:
         """前进。"""
@@ -268,11 +283,19 @@ class MotorController:
         self.set_speed(-pwm, pwm)
 
     def brake(self) -> None:
-        """刹车。"""
-        if self.is_connected:
-            self._chassis.brake()
-        else:
+        """刹车（重发 3 次兜底）。
+
+        ESP32 固件无指令超时看门狗且指令 fire-and-forget 无确认，
+        刹车帧一旦丢失电机会保持最后 PWM；重发 3 次（间隔 30ms）
+        显著降低一次性事件丢帧风险。
+        """
+        if not self.is_connected:
             logger.warning("电机未连接，忽略 brake")
+            return
+        for i in range(3):
+            self._chassis.brake()
+            if i < 2:
+                time.sleep(0.03)
 
     def coast(self) -> None:
         """滑行停止。"""
@@ -290,7 +313,8 @@ class MotorController:
         if self.is_connected:
             try:
                 return self._chassis.get_speeds()
-            except Exception:
+            except Exception as e:
+                self._log_rpm_fail(e)
                 return 0, 0
         return 0, 0
 
@@ -309,16 +333,45 @@ class MotorController:
         if self.is_connected:
             try:
                 return self._chassis.get_cached_rpm(max_age)
-            except Exception:
+            except Exception as e:
+                self._log_rpm_fail(e)
                 return 0, 0
         return 0, 0
+
+    def get_speeds_cached_fresh(self, max_age: float = 0.15):
+        """返回真实轮速反馈：缓存新鲜直接返回；过期则查询。
+
+        查询失败返回 None（不沿用陈旧缓存值冒充真实反馈）——
+        供数据采集使用，失败帧由采集器记 NaN 并在 meta 计数。
+
+        Args:
+            max_age: 缓存最大年龄 (s)
+
+        Returns:
+            (left_rpm, right_rpm)，或查询失败时 None
+        """
+        if not self.is_connected:
+            return None
+        try:
+            return self._chassis.get_cached_rpm_fresh(max_age)
+        except Exception as e:
+            self._log_rpm_fail(e)
+            return None
+
+    def _log_rpm_fail(self, e) -> None:
+        """限频记录 RPM 查询失败（避免 ESP32 失联时日志刷屏）。"""
+        now = time.monotonic()
+        if now - self._last_fail_log > 5.0:
+            logger.warning("RPM 查询失败（串口/ESP32 异常）: %s", e)
+            self._last_fail_log = now
 
     def get_encoder(self) -> tuple[int, int]:
         """读取编码器累计脉冲。"""
         if self.is_connected:
             try:
                 return self._chassis.get_encoder()
-            except Exception:
+            except Exception as e:
+                self._log_rpm_fail(e)
                 return 0, 0
         return 0, 0
 

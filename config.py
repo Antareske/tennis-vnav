@@ -12,6 +12,7 @@ class NavConfig:
     hfov_deg: float = 62.0          # 水平视场角（需实测标定）
     camera_device: int = 0
     camera_fps: int = 15            # 采集帧率
+    camera_stall_timeout_s: float = 1.0  # 帧停滞超时（断连检测），超过则刹车重连
 
     # 相机安装几何（未来启用基于地面平面的深度估计）
     # camera_height_m: float = 0.15
@@ -28,11 +29,16 @@ class NavConfig:
     min_effective_pwm: int = 22     # 最小有效 PWM（实测 22-25）
     speed_scale: float = 1.0        # PWM → 速度比例系数
     max_linear_speed: float = 0.34  # 最大线速度 m/s（实测 PWM>60=104RPM=0.34m/s）
-    max_angular_speed: float = 20.0 # 最大角速度 (deg/s)
+    max_angular_speed: float = 0.349  # 最大角速度 rad/s（≈20°/s，单位契约：rad/s）
 
     # 运动学参数
     wheel_base_m: float = 0.10      # 轮距 (m)
     wheel_diameter_m: float = 0.062 # 轮径 (m)
+
+    # ── 电机经验标定（板端实测值；无运行时标定环节，见 main.py）──
+    calib_fwd_pwm: int = 26         # 前进经验 PWM
+    calib_rot_pwm: int = 26         # 旋转经验 PWM
+    calib_sweep: tuple = ((22, 6.0), (24, 16.0), (26, 22.0))  # PWM→RPM 标定表
 
     # ── RPM 速度目标（替代未标定的 m/s，直接对标电机实测）──
     target_forward_rpm: float = 18.0   # 前进目标 RPM

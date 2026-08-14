@@ -54,11 +54,18 @@ class TennisNavStateMachine:
         motor: MotorController,
         session,
         model_path: str,
+        action_slot=None,
     ):
         self.config = config
         self.motor = motor
         self.session = session
         self.model_path = model_path
+        # 动作槽语义 = 实际下发的最后一条 PWM 指令。所有电机指令必须走
+        # _set_raw/_brake 通道，在指令下发瞬间同步动作槽，保证数采记录的
+        # 是真实输出（而非 tick 返回值，后者在"未发新指令"的 tick 与真实
+        # 输出脱节）。
+        self._action_slot = action_slot
+        self._last_cmd: tuple[int, int] = (0, 0)
 
         # 位姿估计器
         self.estimator = PositionEstimator(
@@ -128,6 +135,9 @@ class TennisNavStateMachine:
                 return 0, 0
         except Exception as e:
             logger.exception("状态机异常: %s", e)
+            # 异常必须刹车：此前直接置 ERROR 会让电机保持最后 PWM 无限运动，
+            # 且 episode 永不结束（is_done 只认 DONE）
+            self._brake()
             self.state = NavState.ERROR
             return 0, 0
 
@@ -137,8 +147,32 @@ class TennisNavStateMachine:
         self._calibrated_rot_pwm = rotation_pwm
         logger.info("Calibrated PWM: forward=%d, rotation=%d", forward_pwm, rotation_pwm)
 
+    # ── 电机指令通道（记录 = 真实输出）──
+
+    def _set_raw(self, left: int, right: int) -> None:
+        """下发原始 PWM，并同步更新动作槽与最后指令寄存器。"""
+        self.motor.set_raw_speed(left, right)
+        self._last_cmd = (left, right)
+        self._publish_action()
+
+    def _brake(self) -> None:
+        """刹车（motor 层重发兜底），并同步动作槽为 (0,0)。"""
+        self.motor.brake()
+        self._last_cmd = (0, 0)
+        self._publish_action()
+
+    def _publish_action(self) -> None:
+        if self._action_slot is not None:
+            self._action_slot.set(*self._last_cmd)
+
+    @property
+    def last_cmd(self) -> tuple[int, int]:
+        """实际下发的最后一条 PWM 指令（供主循环日志与数采使用）。"""
+        return self._last_cmd
+
     def is_done(self) -> bool:
-        return self.state == NavState.DONE
+        # ERROR 同样终止 episode（收尾刹车保存数据），避免挂死
+        return self.state in (NavState.DONE, NavState.ERROR)
 
     @property
     def status_text(self) -> str:
@@ -163,7 +197,7 @@ class TennisNavStateMachine:
 
             if self._search_confirm_count >= self.config.search_confirm_frames:
                 logger.info("SEARCH → OBSERVE")
-                self.motor.brake()
+                self._brake()
                 self._search_confirm_count = 0
                 self._transition(NavState.OBSERVE)
                 self._observe_settle_time = time.time() + self.config.settle_time_ms / 1000.0
@@ -174,7 +208,7 @@ class TennisNavStateMachine:
 
         # 继续顺时针旋转（使用标定后的旋转 PWM）
         pwm = self._calibrated_rot_pwm if self._calibrated_rot_pwm > 0 else self.config.min_effective_pwm + 3
-        self.motor.set_raw_speed(pwm, -pwm)
+        self._set_raw(pwm, -pwm)
         return pwm, -pwm
 
     # ── OBSERVE ──
@@ -214,9 +248,9 @@ class TennisNavStateMachine:
             # 估计不可靠（太远等），前进一段再搜索
             logger.info("OBSERVE: 位姿估计不可靠，前进探索")
             pwm = self.config.min_effective_pwm + 10
-            self.motor.set_raw_speed(pwm, pwm)
+            self._set_raw(pwm, pwm)
             time.sleep(0.5)
-            self.motor.brake()
+            self._brake()
             self._transition(NavState.SEARCH)
             return 0, 0
 
@@ -239,11 +273,11 @@ class TennisNavStateMachine:
             return
         pwm = max(1, self._calibrated_rot_pwm // 2) if self._calibrated_rot_pwm > 0 else 3
         if error > 0:
-            self.motor.set_raw_speed(pwm, -pwm)
+            self._set_raw(pwm, -pwm)
         else:
-            self.motor.set_raw_speed(-pwm, pwm)
+            self._set_raw(-pwm, pwm)
         time.sleep(0.15)
-        self.motor.brake()
+        self._brake()
 
     # ── APPROACH ──
 
@@ -252,7 +286,7 @@ class TennisNavStateMachine:
         if self._current_bbox is None:
             self._ball_lost_count += 1
             if self._ball_lost_count == 1:
-                self.motor.brake()
+                self._brake()
             # 等待 ~1.5s (约 20 帧) 尝试重新捕获
             if self._ball_lost_count > 20:
                 logger.warning("APPROACH: 丢失网球超时，回到 SEARCH")
@@ -270,7 +304,7 @@ class TennisNavStateMachine:
         # 到达目标距离 → 停车完成
         if ball_z <= self._target_z * 1.1:
             logger.info("APPROACH → DONE (Z=%.3f <= target=%.3f)", ball_z, self._target_z)
-            self.motor.brake()
+            self._brake()
             self._transition(NavState.DONE)
             return 0, 0
 
@@ -280,7 +314,7 @@ class TennisNavStateMachine:
         if abs(ball_x) < self.config.approach_deadband_m:
             self._lateral_error_accum = 0.0
             self._prev_ball_x_sign = 0
-            self.motor.set_raw_speed(fwd, fwd)
+            self._set_raw(fwd, fwd)
             return fwd, fwd
 
         # 基础修正：横向偏差 → PWM 差异
@@ -319,16 +353,22 @@ class TennisNavStateMachine:
         lp = self.motor.adapt_pwm(lp, actual_l, max_pwm=abs_max)
         rp = self.motor.adapt_pwm(rp, actual_r, max_pwm=abs_max)
 
-        # 打滑检测：一侧 RPM 远低于另一侧 → 微调对侧（单帧最多 +1）
+        # 打滑检测：每轮实际 RPM 与其 PWM 的期望 RPM 比较（左右互比会
+        # 在有意图的差速转向时必然误触发，系统性削弱转向修正）。
+        # 打滑轮转速显著高于其 PWM 期望值 → 微调对侧（单帧最多 +1，保持
+        # 实测有效的补偿方向）。注意日志轮别：此处"左轮打滑"指左轮转速
+        # 异常偏高，与补偿动作（右 PWM+1）方向一致。
+        exp_l = self.motor.expected_rpm(lp)
+        exp_r = self.motor.expected_rpm(rp)
         al, ar = abs(actual_l), abs(actual_r)
-        if al > 5 and ar > 0 and al > ar * 3:
+        if exp_l > 0 and al > exp_l * 2 + 5:
             rp = min(rp + 1, abs_max)
-            logger.info("slip: 左轮打滑(L=%d R=%d) → 右PWM+1=%d", actual_l, actual_r, rp)
-        elif ar > 5 and al > 0 and ar > al * 3:
+            logger.info("slip: 左轮打滑(L=%d exp=%.0f) → 右PWM+1=%d", actual_l, exp_l, rp)
+        elif exp_r > 0 and ar > exp_r * 2 + 5:
             lp = min(lp + 1, abs_max)
-            logger.info("slip: 右轮打滑(L=%d R=%d) → 左PWM+1=%d", actual_l, actual_r, lp)
+            logger.info("slip: 右轮打滑(R=%d exp=%.0f) → 左PWM+1=%d", actual_r, exp_r, lp)
 
-        self.motor.set_raw_speed(lp, rp)
+        self._set_raw(lp, rp)
         return lp, rp
 
     # ── 辅助 ──
@@ -340,7 +380,7 @@ class TennisNavStateMachine:
         self._state_start_time = time.time()
         # 非运动状态下刹车
         if new_state != NavState.APPROACH:
-            self.motor.brake()
+            self._brake()
 
     def _update_odometry(self):
         """基于电机 RPM 更新里程计。"""

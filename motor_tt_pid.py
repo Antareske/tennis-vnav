@@ -220,6 +220,18 @@ class TtPidChassis:
             return self._cached_rpm
         return rpm.left, rpm.right
 
+    def get_cached_rpm_fresh(self, max_age: float = 0.15) -> Optional[tuple[int, int]]:
+        """返回真实 RPM：缓存新鲜直接用；过期则查询，查询失败返回 None。
+
+        供数据采集使用——不得用陈旧缓存值冒充真实轮速反馈。
+        """
+        if time.monotonic() - self._cached_rpm_ts <= max_age:
+            return self._cached_rpm
+        rpm = self.get_rpm()
+        if rpm is None:
+            return None
+        return rpm.left, rpm.right
+
     def reset(self) -> bool:
         """重置控制器。"""
         rsp = self._send_cmd(CMD_RESET)

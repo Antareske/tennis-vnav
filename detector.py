@@ -153,7 +153,8 @@ def yolo_infer(
     if _TPU_AVAILABLE:
         tpu = _get_tpu_backend(model_path)
         if tpu is None:
-            return []
+            # 后端初始化失败 ≠ 无目标：抛异常走 episode 错误路径
+            raise RuntimeError("TPU 后端不可用（初始化失败）")
         H, W = frame.shape[:2]
         return tpu.detect(frame, img_width=W, img_height=H)
 

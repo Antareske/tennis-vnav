@@ -28,16 +28,26 @@ STATUS_FILE = "/tmp/vnav/status.json"
 
 
 def read_command() -> Optional[str]:
-    """读取并消费命令文件（读到即删，原子消费）。"""
+    """读取并消费命令文件（rename 原子消费）。
+
+    先 rename 再读内容：与 ctrl-serve 的 tmp+rename 原子写同构，
+    消除「读到旧命令后删除时误删新命令」的竞态窗口。
+    """
+    consumed = CMD_FILE + ".consumed"
     try:
-        cmd = Path(CMD_FILE).read_text().strip()
+        os.replace(CMD_FILE, consumed)
     except OSError:
         return None
-    if cmd:
+    try:
+        cmd = Path(consumed).read_text().strip()
+    except OSError:
+        cmd = ""
+    finally:
         try:
-            os.remove(CMD_FILE)
+            os.remove(consumed)
         except OSError:
             pass
+    if cmd:
         logger.info("收到命令: %s", cmd)
         return cmd
     return None
@@ -66,25 +76,51 @@ def write_status(status: dict) -> None:
         logger.warning("写状态文件失败: %s", e)
 
 
+def _episode_id_from_name(name: str) -> Optional[int]:
+    """从目录名解析 episode 编号（非数字返回 None，不抛异常）。"""
+    try:
+        return int(name.split("_", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
 def count_episodes(data_root: Path) -> int:
-    """统计 data 目录中的组数。"""
+    """统计 data 目录中的组数（仅计数已落盘完成的 episode）。"""
     if not data_root.exists():
         return 0
-    return len([d for d in data_root.iterdir() if d.is_dir() and d.name.startswith("episode_")])
+    count = 0
+    for d in data_root.iterdir():
+        if not d.is_dir() or not d.name.startswith("episode_"):
+            continue
+        if _episode_id_from_name(d.name) is None:
+            continue
+        if (d / "states.npy").exists():
+            count += 1
+    return count
 
 
 def delete_last_episode(data_root: Path) -> Optional[int]:
-    """删除编号最大的一组，返回被删的组号（无数据返回 None）。"""
+    """删除编号最大的一组，返回被删的组号（无数据返回 None）。
+
+    按数值编号排序（非字典序）；非法目录名跳过不崩溃。
+    """
     if not data_root.exists():
         return None
-    episodes = sorted(
-        (d for d in data_root.iterdir() if d.is_dir() and d.name.startswith("episode_")),
-        key=lambda d: d.name,
-    )
-    if not episodes:
+    best_eid: Optional[int] = None
+    best_dir = None
+    for d in data_root.iterdir():
+        if not d.is_dir() or not d.name.startswith("episode_"):
+            continue
+        eid = _episode_id_from_name(d.name)
+        if eid is None:
+            logger.warning("忽略非法 episode 目录名: %s", d.name)
+            continue
+        if best_eid is None or eid > best_eid:
+            best_eid = eid
+            best_dir = d
+    if best_dir is None:
+        logger.warning("无合法 episode 目录可删除")
         return None
-    last = episodes[-1]
-    eid = int(last.name.split("_")[1])
-    shutil.rmtree(str(last), ignore_errors=True)
-    logger.info("已删除第 %d 组数据: %s", eid, last)
-    return eid
+    shutil.rmtree(str(best_dir), ignore_errors=True)
+    logger.info("已删除第 %d 组数据: %s", best_eid, best_dir)
+    return best_eid

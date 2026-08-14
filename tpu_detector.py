@@ -760,8 +760,10 @@ class TpuDetector:
         forward_ms = (time.time() - forward_start) * 1000
 
         if ret != CVI_RC_SUCCESS:
-            logger.error("CVI_NN_Forward failed: %d", ret)
-            return []
+            # 推理失败与"无目标"必须区分：返回空列表会被状态机当丢球
+            # 处理（无限旋转无告警），抛异常则走主循环的 episode 错误
+            # 路径（刹车 + 保存数据 + status 报错）
+            raise RuntimeError(f"CVI_NN_Forward failed: {ret}")
 
         # ── 读取输出 ──
         postprocess_start = time.time()
@@ -769,7 +771,7 @@ class TpuDetector:
         # 读取输出数据 (含反量化)
         data = _tensor_data_to_f32(self._outputs_ptr, lib)
         if data is None:
-            return []
+            raise RuntimeError("TPU 输出张量读取失败")
 
         read_ms = (time.time() - postprocess_start) * 1000
 

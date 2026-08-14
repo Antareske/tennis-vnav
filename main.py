@@ -18,6 +18,8 @@
 import argparse
 import logging
 import os
+import platform
+import signal
 import sys
 import time
 from pathlib import Path
@@ -108,11 +110,23 @@ def main():
     else:
         logger.info("电机已连接: %s", args.motor_port)
 
-    # ── 电机标定（经验 PWM）──
-    fwd_pwm = 26
-    rot_pwm = 26
-    motor.set_calib_sweep([(22, 6.0), (24, 16.0), (26, 22.0)])
-    logger.info("使用经验 PWM: 前进=%d, 旋转=%d", fwd_pwm, rot_pwm)
+    # ── 电机经验标定（来自 NavConfig，板端实测值；无运行时标定环节）──
+    fwd_pwm = config.calib_fwd_pwm
+    rot_pwm = config.calib_rot_pwm
+    motor.set_calib_sweep(list(config.calib_sweep))
+    logger.info("使用经验 PWM（NavConfig）: 前进=%d, 旋转=%d", fwd_pwm, rot_pwm)
+
+    # ── 信号处理：SIGTERM 时先刹车再退出（finally 会再清理；
+    #     崩溃路径无 finally 时电机保持最后 PWM，故必须急停）──
+    def _on_terminate(signum, _frame):
+        logger.warning("收到信号 %d，刹车后退出", signum)
+        try:
+            motor.brake()
+        except Exception:
+            pass
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _on_terminate)
 
     # ── 初始化 YOLO ──
     from detector import _get_session
@@ -167,27 +181,38 @@ def main():
 
             action_slot = SharedSlot()
 
-            # 编码器（硬件 VENC 失败回退软件）
+            # 编码器：板端 VENC 硬件编码，失败直接中止（软件编码 ~300ms/帧
+            # 无法满足 10 FPS 且此前会静默产出 0 帧数据）
+            collector = None
             if not args.no_collect:
                 try:
                     from hwjpeg_enc import HwJpegEncoder
                     encoder = HwJpegEncoder(
                         width=config.img_width, height=config.img_height, quality=60)
                 except Exception as e:
-                    logger.warning("VENC 硬件编码不可用 (%s)，回退软件编码", e)
+                    if platform.machine() in ("riscv64", "riscv32"):
+                        logger.error("VENC 硬件编码不可用（%s），板端不启用软件回退，退出", e)
+                        sys.exit(1)
+                    logger.warning("VENC 不可用（%s），非板端环境使用软件编码调试", e)
                     encoder = Cv2JpegEncoder()
-                collector = DataCollector(output_dir=episode_dir, fps=10, encoder=encoder)
-                collector.start_async(camera, motor, action_slot)
-                time.sleep(0.5)  # 导航前静止采样
-            else:
-                collector = None
+                try:
+                    collector = DataCollector(output_dir=episode_dir, fps=10, encoder=encoder)
+                    collector.start_async(camera, motor, action_slot)
+                    time.sleep(0.5)  # 导航前静止采样
+                except Exception as e:
+                    logger.exception("数采初始化失败: %s", e)
+                    motor.brake()
+                    push_status("IDLE", episode_id=episode_id,
+                                error=f"第 {episode_id} 组初始化失败: {e}")
+                    continue
 
-            # 每集新状态机（清空位姿估计与状态）
+            # 每集新状态机（清空位姿估计与状态；动作槽 = 实际下发指令）
             sm = TennisNavStateMachine(
                 config=config,
                 motor=motor,
                 session=session,
                 model_path=config.model_path,
+                action_slot=action_slot,
             )
             sm.set_calibrated_pwm(fwd_pwm, rot_pwm)
 
@@ -212,7 +237,29 @@ def main():
                         # 采集中忽略这两个命令
                         pass
 
-                    # 读取帧（带断连重试）
+                    # 摄像头帧停滞检测（断连/掉线）：刹车 + 重连，
+                    # 重连失败中止本集（此前帧冻结会让电机保持最后 PWM 空转）
+                    if time.monotonic() - camera.frame_ts > config.camera_stall_timeout_s:
+                        motor.brake()
+                        action_slot.set(0, 0)
+                        logger.error("摄像头帧停滞 %.1fs，刹车并尝试重连",
+                                     time.monotonic() - camera.frame_ts)
+                        reconnected = False
+                        for attempt in range(3):
+                            logger.info("摄像头重连尝试 %d/3", attempt + 1)
+                            if camera.reconnect():
+                                reconnected = True
+                                break
+                            time.sleep(1.0)
+                        if reconnected:
+                            logger.info("摄像头重连成功")
+                            last_frame_ts = camera.frame_ts
+                            continue
+                        error_msg = "摄像头重连失败，中止本集"
+                        logger.error(error_msg)
+                        break
+
+                    # 读取帧
                     ret, frame = camera.read_bgr()
                     if not ret or frame is None:
                         time.sleep(0.01)
@@ -227,16 +274,16 @@ def main():
                     last_frame_ts = camera.frame_ts
                     last_tick_time = now
 
-                    # 状态机 tick
-                    left_pwm, right_pwm = sm.tick(frame)
-                    action_slot.set(left_pwm, right_pwm)
+                    # 状态机 tick（动作槽由状态机在指令下发瞬间同步，
+                    # 记录真实输出而非 tick 返回值）
+                    sm.tick(frame)
                     fps_frame_count += 1
 
                     # FPS 显示
                     if now - fps_update_time >= 2.0:
                         fps = fps_frame_count / (now - fps_update_time)
                         logger.info("%s | FPS=%.1f | PWM=(%d, %d)",
-                                    sm.status_text, fps, left_pwm, right_pwm)
+                                    sm.status_text, fps, *sm.last_cmd)
                         fps_update_time = now
                         fps_frame_count = 0
 
@@ -249,11 +296,13 @@ def main():
                                     frames=collector.frame_count if collector else 0)
 
                 # 正常完成 → 导航后静止采样 1s
-                if not aborted:
+                if not aborted and sm.state == NavState.DONE:
                     action_slot.set(0, 0)
                     if collector is not None:
                         logger.info("导航完成，导航后静止采样 1s...")
                         time.sleep(1.0)
+                elif not aborted and sm.state == NavState.ERROR:
+                    error_msg = "状态机异常终止（已刹车）"
             except Exception as e:
                 logger.exception("主循环异常: %s", e)
                 error_msg = f"{e}"
@@ -262,9 +311,20 @@ def main():
             motor.brake()
             action_slot.set(0, 0)
             if collector is not None:
-                count = collector.stop()
-                if count > 0:
-                    logger.info("数据已保存到: %s (%d 帧)", collector.output_dir, count)
+                if aborted:
+                    completion = "aborted"
+                elif error_msg or sm.state == NavState.ERROR:
+                    completion = "error"
+                else:
+                    completion = "done"
+                try:
+                    count = collector.stop(completion=completion)
+                    if count > 0:
+                        logger.info("数据已保存到: %s (%d 帧)", collector.output_dir, count)
+                except Exception as e:
+                    logger.exception("数据收尾异常（已尽力保存）: %s", e)
+                    push_status("IDLE", episode_id=episode_id,
+                                error=f"第 {episode_id} 组收尾出错: {e}")
             last_episode_id = episode_id
 
             if aborted:

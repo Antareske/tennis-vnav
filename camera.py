@@ -76,22 +76,36 @@ class Camera:
         return False
 
     def _start_capture(self):
-        """启动采集线程"""
+        """启动采集线程。
+
+        若旧线程仍在退出（重连场景），先等它结束——防止两个线程
+        同时操作同一个 VideoCapture 实例。
+        """
         if self._running:
             return
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2)
         self._running = True
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
 
     def _capture_loop(self):
-        """独立采集线程，只保留最新帧"""
+        """独立采集线程，只保留最新帧。
+
+        cap 按线程本地绑定：重连替换 self._cap 后，旧线程在下一轮循环
+        发现 cap 不再匹配即退出，不会与新的采集线程抢占同一设备。
+        """
         interval = 1.0 / max(1, self._fps)
-        while self._running:
+        cap = self._cap
+        while self._running and cap is self._cap:
             loop_start = time.monotonic()
-            if self._cap is None or not self._cap.isOpened():
+            if cap is None or not cap.isOpened():
                 time.sleep(0.1)
                 continue
-            ret, frame = self._cap.read()
+            ret, frame = cap.read()
+            if cap is not self._cap:
+                # 已被重连替换，丢弃旧线程的帧
+                continue
             if not ret or frame is None:
                 time.sleep(0.01)
                 continue
