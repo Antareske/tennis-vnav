@@ -18,7 +18,6 @@
 import argparse
 import logging
 import os
-import platform
 import signal
 import sys
 import time
@@ -31,7 +30,7 @@ from config import NavConfig, CALIB_FILE
 from camera import Camera
 from motor import MotorController
 from state_machine import TennisNavStateMachine, NavState
-from data_collector import (DataCollector, SharedSlot, Cv2JpegEncoder,
+from data_collector import (DataCollector, SharedSlot,
                             next_episode_id, _resolve_data_root)
 from vnav_control import (read_command, wait_command, write_status,
                           count_episodes, delete_last_episode)
@@ -92,8 +91,9 @@ def main():
     except Exception as e:
         logger.error("摄像头初始化失败: %s", e)
         sys.exit(1)
-    logger.info("摄像头已就绪: %dx%d @ %dfps",
-                config.img_width, config.img_height, config.camera_fps)
+    logger.info("摄像头已就绪: %dx%d @ %dfps%s",
+                config.img_width, config.img_height, config.camera_fps,
+                " (MJPEG 原始流)" if camera.is_mjpeg else " (非 MJPEG)")
 
     # ── 初始化电机 ──
     motor = MotorController(
@@ -181,22 +181,13 @@ def main():
 
             action_slot = SharedSlot()
 
-            # 编码器：板端 VENC 硬件编码，失败直接中止（软件编码 ~300ms/帧
-            # 无法满足 10 FPS 且此前会静默产出 0 帧数据）
+            # 数采编码：相机 MJPEG 原始 JPEG 字节直写落盘（相机硬件编码，
+            # 无 VENC/软件编码环节；内核 UVC 负载远低于 YUYV 原始流）
             collector = None
             if not args.no_collect:
                 try:
-                    from hwjpeg_enc import HwJpegEncoder
-                    encoder = HwJpegEncoder(
-                        width=config.img_width, height=config.img_height, quality=60)
-                except Exception as e:
-                    if platform.machine() in ("riscv64", "riscv32"):
-                        logger.error("VENC 硬件编码不可用（%s），板端不启用软件回退，退出", e)
-                        sys.exit(1)
-                    logger.warning("VENC 不可用（%s），非板端环境使用软件编码调试", e)
-                    encoder = Cv2JpegEncoder()
-                try:
-                    collector = DataCollector(output_dir=episode_dir, fps=10, encoder=encoder)
+                    collector = DataCollector(output_dir=episode_dir, fps=10,
+                                              encoder=None)
                     collector.start_async(camera, motor, action_slot)
                     time.sleep(0.5)  # 导航前静止采样
                 except Exception as e:
@@ -259,20 +250,21 @@ def main():
                         logger.error(error_msg)
                         break
 
-                    # 读取帧
-                    ret, frame = camera.read_bgr()
-                    if not ret or frame is None:
-                        time.sleep(0.01)
-                        continue
-                    frame_count += 1
-
-                    # 限频 + 去重：同帧不重复推理
+                    # 限频 + 去重：先查帧时间戳（MJPEG 解码 ~80ms/帧，
+                    # 必须先过滤重复帧，否则每轮空转都要白付解码成本）
                     now = time.time()
                     if camera.frame_ts == last_frame_ts or now - last_tick_time < 0.15:
                         time.sleep(0.01)
                         continue
                     last_frame_ts = camera.frame_ts
                     last_tick_time = now
+
+                    # 读取并解码帧（仅新帧）
+                    ret, frame = camera.read_bgr()
+                    if not ret or frame is None:
+                        time.sleep(0.01)
+                        continue
+                    frame_count += 1
 
                     # 状态机 tick（动作槽由状态机在指令下发瞬间同步，
                     # 记录真实输出而非 tick 返回值）
@@ -287,13 +279,14 @@ def main():
                         fps_update_time = now
                         fps_frame_count = 0
 
-                    # 状态推送（~1Hz）
+                    # 状态推送（~1Hz，含实时有效 FPS 供网页显示）
                     if now - last_status_time >= 1.0:
                         last_status_time = now
                         push_status("COLLECTING",
                                     episode_id=episode_id,
                                     nav_state=sm.state.name,
-                                    frames=collector.frame_count if collector else 0)
+                                    frames=collector.frame_count if collector else 0,
+                                    effective_fps=collector.effective_fps if collector else None)
 
                 # 正常完成 → 导航后静止采样 1s
                 if not aborted and sm.state == NavState.DONE:
@@ -326,6 +319,11 @@ def main():
                     push_status("IDLE", episode_id=episode_id,
                                 error=f"第 {episode_id} 组收尾出错: {e}")
             last_episode_id = episode_id
+
+            # 本轮结果推送到网页（含最终有效 FPS）
+            push_status("IDLE", episode_id=episode_id,
+                        frames=collector.frame_count if collector else 0,
+                        effective_fps=collector.effective_fps if collector else None)
 
             if aborted:
                 logger.info("第 %d 组已中止（数据已保存）", episode_id)

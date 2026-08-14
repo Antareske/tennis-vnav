@@ -30,6 +30,7 @@ class Camera:
         self._frame_lock = threading.Lock()
         self._frame_ready = threading.Event()
         self._running = False
+        self._mjpeg = False
         self._thread: threading.Thread | None = None
 
     @classmethod
@@ -66,8 +67,13 @@ class Camera:
                 self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
                 self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
                 self._cap.set(cv2.CAP_PROP_FPS, self._fps)
-                # 取原始 YUYV（摄像头原生格式）：省 BGR 转换，数采直接喂 VENC
+                # MJPEG 原始流：相机内部硬件 JPEG 压缩，USB 载荷 ~46KB/帧
+                # （YUYV 原始流 614KB/帧，板端内核 UVC 处理占单核 ~40%）。
+                # CONVERT_RGB=0 下 read() 返回原始 JPEG 字节（1-D 数组）。
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
                 cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+                self._mjpeg = (int(cap.get(cv2.CAP_PROP_FOURCC))
+                              == cv2.VideoWriter_fourcc(*"MJPG"))
                 return True
             cap.release()
 
@@ -146,17 +152,28 @@ class Camera:
         with self._frame_lock:
             return self._frame_ts
 
+    @property
+    def is_mjpeg(self) -> bool:
+        """是否协商为 MJPEG 原始流（read() 返回 JPEG 字节）。"""
+        return self._mjpeg
+
     def read_bgr(self):
         """读取最新帧并转换为 BGR（YOLO 路径用）。
 
-        read() 返回原始 YUYV（摄像头原生格式）；本方法转 BGR，
-        cv2.cvtColor 释放 GIL，不阻塞其他线程。
+        MJPEG 原始流：read() 返回 JPEG 字节 → imdecode 解码
+        （板端实测 ~80ms/帧，imdecode 释放 GIL）；
+        非 MJPEG（YUYV 回退）：cvtColor 转换。
         """
         ret, frame = self.read()
         if not ret or frame is None:
             return False, None
         try:
             import cv2
+            if self._mjpeg:
+                bgr = cv2.imdecode(frame, cv2.IMREAD_COLOR)
+                if bgr is None:
+                    return False, None
+                return True, bgr
             bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YUYV)
             return True, bgr
         except Exception:

@@ -1,7 +1,8 @@
 """数据采集模块。
 
 以 10 FPS 独立线程采集训练数据（时间驱动，与导航主循环解耦）。
-图像经硬件 VENC 编码为 JPEG 落盘，状态/动作累积在内存中，stop() 时写入 .npy。
+图像为相机 MJPEG 原始 JPEG 字节直写落盘（相机硬件编码，无 VENC/软件
+编码环节），状态/动作累积在内存中，stop() 时写入 .npy。
 
 数据真实性契约（每帧样本内 image/state/action/timestamps 严格一一对应）：
   - 图像写盘失败 → 该帧的三个数组一起跳过，不产生错位；
@@ -114,8 +115,8 @@ class DataCollector:
     """导航数据采集器（异步线程模式）。
 
     采样节奏由独立线程的时间基准驱动：固定 100ms 间隔，
-    与导航主循环帧率无关。JPEG 编码交给硬件 VENC（ctypes 调用
-    释放 GIL，编码期间主循环照常运行）。
+    与导航主循环帧率无关。图像为相机 MJPEG 原始 JPEG 字节直写
+    （encoder=None），或经外部编码器编码后落盘。
 
     数据一致性设计：
       - 图像先写 tmpfs 暂存，episode 结束时搬移至 SD；
@@ -128,7 +129,8 @@ class DataCollector:
     Args:
         output_dir: episode 输出目录
         fps: 采样帧率（默认 10）
-        encoder: JPEG 编码器（encode(frame)->bytes 接口）
+        encoder: JPEG 编码器（encode(frame)->bytes 接口）；
+            None 时帧为相机 MJPEG 原始 JPEG 字节，直写落盘
     """
 
     def __init__(
@@ -140,7 +142,9 @@ class DataCollector:
         self.output_dir = Path(output_dir)
         self.fps = fps
         self._interval = 1.0 / fps
-        self._encoder = encoder if encoder is not None else Cv2JpegEncoder()
+        # encoder=None 表示帧为相机 MJPEG 原始字节，直写落盘（不再默认
+        # 软件编码器：会把原始 JPEG 字节误当图像数组重新编码）
+        self._encoder = encoder
         self._frame_count: int = 0
         self._running: bool = False
         self._thread: Optional[threading.Thread] = None
@@ -163,6 +167,7 @@ class DataCollector:
         self._camera_failures: int = 0           # 摄像头读帧失败次数
         self._motor_connected: bool = False      # 采样开始时的电机连接状态
         self._last_frame_ts: float = -1.0        # 上一采样帧的摄像头时间戳
+        self._last_effective_fps: float = 0.0    # stop() 定格的最终有效 FPS
 
     # ── 公共接口 ──
 
@@ -265,7 +270,7 @@ class DataCollector:
     ) -> None:
         """编码并写入一帧采样数据（帧内原子：图像与数组同步跳过）。"""
         try:
-            jpeg = self._encoder.encode(frame)
+            jpeg = self._to_jpeg(frame)
         except Exception as e:
             logger.error("JPEG 编码失败: %s", e)
             self._encode_errors += 1
@@ -310,6 +315,25 @@ class DataCollector:
             elapsed = time.time() - self._start_time
             logger.info("数据采集中: %d 帧 (%.1fs)", self._frame_count, elapsed)
 
+    def _to_jpeg(self, frame) -> bytes:
+        """帧 → JPEG 字节。
+
+        encoder 为 None 时帧是相机 MJPEG 原始字节（OpenCV 以 (1, N)
+        数组返回，非 1-D）——以 JPEG 魔数 FFD8 判定；多维图像数组
+        （非 MJPEG 相机回退）走 cv2 软件编码兜底。
+        """
+        if self._encoder is not None:
+            return self._encoder.encode(frame)
+        raw = frame.reshape(-1)
+        if raw.size >= 2 and int(raw[0]) == 0xFF and int(raw[1]) == 0xD8:
+            return frame.tobytes()
+        import cv2
+        success, encoded = cv2.imencode(
+            ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        if not success:
+            raise RuntimeError("cv2 JPEG 编码失败")
+        return encoded.tobytes()
+
     def _drain_stage(self, max_moves: int) -> None:
         """把 tmpfs 暂存图像渐进搬移到 episode 目录（按文件名顺序）。"""
         if self._stage_dir is None:
@@ -341,6 +365,9 @@ class DataCollector:
         """
         self._completion = completion
         self._running = False
+        # 采样时长在停止采样瞬间定格：收尾搬移/落盘不属采样活动，
+        # 不计入 effective_fps 分母
+        duration = time.time() - self._start_time
         if self._thread is not None:
             self._thread.join(timeout=3)
             if self._thread.is_alive():
@@ -355,8 +382,8 @@ class DataCollector:
 
         n_images = len(list(self._img_dir.glob("*.jpg"))) if self._img_dir.exists() else 0
 
-        duration = time.time() - self._start_time
         effective_fps = self._frame_count / duration if duration > 0 else 0
+        self._last_effective_fps = effective_fps
 
         jitter = {}
         if len(self._timestamps) >= 2:
@@ -446,6 +473,7 @@ class DataCollector:
             "aligned": aligned,
             "qualified": qualified,
             "completion": self._completion,
+            "image_source": "camera_mjpeg" if self._encoder is None else "encoder",
             "motor_connected": self._motor_connected,
             "duplicate_frames": self._duplicate_frames,
             "uart_errors": self._uart_errors,
@@ -474,6 +502,14 @@ class DataCollector:
     @property
     def frame_count(self) -> int:
         return self._frame_count
+
+    @property
+    def effective_fps(self) -> float:
+        """当前有效采样率：运行中为实时值，结束后为 stop() 定格值。"""
+        if self._running and self._start_time > 0:
+            elapsed = time.time() - self._start_time
+            return self._frame_count / elapsed if elapsed > 0 else 0.0
+        return self._last_effective_fps
 
     @property
     def is_running(self) -> bool:
