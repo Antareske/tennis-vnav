@@ -1,0 +1,11 @@
+#!/bin/sh
+# AP 热点开机自启（BusyBox rcS 约定：S 前缀按序执行）
+# 部署: cp services/S98apstart /etc/init.d/S98apstart && chmod +x /etc/init.d/S98apstart
+# 顺序: S98apstart（AP 就绪）之后 S99vnav（vnav 服务）执行
+sleep 20
+killall wpa_supplicant hostapd udhcpd 2>/dev/null
+
+ifconfig wlan0 192.168.4.1 netmask 255.255.255.0 up
+udhcpd /etc/udhcpd.conf &
+hostapd -B /etc/hostapd.conf
+exit 0

@@ -112,13 +112,17 @@ cargo build --release --target riscv64gc-unknown-linux-musl -Zbuild-std=std,pani
 纯净镜像 + 仓库即可部署（无需 AKA-00 等外部项目）：
 
 ```bash
-# 一键部署（上传全部资产 + 安装自启 + 重启服务）
+# 0. 板端一次性初始化（新镜像首次）：安装 AP 热点 + 禁用 AKA-00 自启（幂等）
+./scripts/board-setup.sh                     # 默认 root@192.168.4.1
+
+# 1. 一键部署（上传全部资产 + 安装自启 + 重启服务）
 ./scripts/deploy.sh                          # 默认 root@192.168.4.1
 ./scripts/deploy.sh --no-restart             # 仅上传，重启板子后生效
 ```
 
 部署完成后：重启板子（或脚本已重启服务），开机流程为
-`S98apstart（AP 热点）→ S99vnav（UART pinmux + ctrl-serve + main.py）`。
+`S98apstart（AP 热点）→ S99vnav（UART pinmux + ctrl-serve + main.py 双保活）`。
+AKA-00 不再开机运行（其自启脚本被移出 init.d，备份于 `/root/S99webstart.disabled`）。
 
 手动启动（调试用）：
 

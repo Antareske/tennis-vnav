@@ -35,9 +35,10 @@ echo "=== tennis-vnav 部署 → $HOST ==="
 
 # ── 0. 停止旧进程 ──
 # 板端 BusyBox 无 pkill/pgrep，killall 按进程名匹配（纯镜像无其他
-# python3 服务，无差别杀 python3 安全）
+# python3 服务，无差别杀 python3 安全）。S99vnav 为保活循环 shell，
+# 必须一并停止，否则服务被杀后 3s 内会被拉起、覆盖二进制会失败。
 echo "[0/4] 停止旧进程..."
-$SSH "$HOST" "killall python3 ctrl-serve 2>/dev/null; sleep 1" || true
+$SSH "$HOST" "killall python3 ctrl-serve S99vnav 2>/dev/null; sleep 1" || true
 
 # ── 1. 运行时 Python 文件（仅运行时依赖闭包；机械臂等未启用模块不上传）──
 PY_FILES="
@@ -65,13 +66,9 @@ $SSH "$HOST" "chmod +x /etc/init.d/S99vnav"
 # ── 4. 重启服务 ──
 if [ "$RESTART" = true ]; then
     echo "[4/4] 重启服务..."
-    $SSH "$HOST" "killall python3 ctrl-serve 2>/dev/null; sleep 1;
-        if ! devmem 0x03001064 32 0x6; then echo '[deploy] pinmux 失败' >&2; fi;
-        if ! devmem 0x03001068 32 0x6; then echo '[deploy] pinmux 失败' >&2; fi;
-        nohup $BOARD_DIR/ctrl-serve > /tmp/ctrl-serve.log 2>&1 &
-        cd $BOARD_DIR &&
-        nohup env LD_LIBRARY_PATH=$BOARD_DIR/cvi-libs:/usr/bin/dl_lib:/usr/bin/lib \
-            python3 main.py > /tmp/vnav.log 2>&1 &
+    # 直接调用已安装的 S99vnav（含保活循环），nohup 防止 SSH 退出时挂掉
+    $SSH "$HOST" "killall python3 ctrl-serve S99vnav 2>/dev/null; sleep 1;
+        nohup /etc/init.d/S99vnav start >/dev/null 2>&1 &
         sleep 5"
     echo "服务已重启，验证:"
     $SSH "$HOST" "ps | grep -q '[p]ython3 main.py' && echo 'main.py: alive' || echo 'main.py: NOT RUNNING';
